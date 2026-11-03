@@ -38,6 +38,7 @@ read_cheap_ads = true    # open the ad of every new car under its p10 to check f
 bucket = 3               # year-band width inside a generation
 min_n = 5                # smallest group shown
 candidates = 300         # unread candidates listed for description checks
+nightly_reads = 150      # unchecked ads the nightly job reads per site (0 = none)
 pooled = true            # LightGBM price model (false = per-group baselines)
 
 [dashboard]

@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.dupes import find_duplicates, save_duplicates
+from collectors.verdicts import (IMPLAUSIBLE_SHARE, VERDICTS, classify, label_agrees,
+                                 load_labels, text_flags)
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
@@ -255,41 +257,6 @@ def expected_price(fit, km, year):
 
 
 # --------------------------------------------------------------------------- #
-# Damage / problem flags from the seller's own words
-# --------------------------------------------------------------------------- #
-# Phrases that DENY a problem are removed first, so "be defektų", "nedaužtas"
-# or "jokių gedimų" never count as hits. \b keeps "nedaužtas" from matching
-# "daužt" too, but the explicit list is what makes the intent readable.
-NEGATIONS_RE = re.compile(
-    r"\b(be|nėra|nera|jokių|jokiu|neturi|nebuvo|neturėjo)\s+(jokių\s+|jokiu\s+)?"
-    r"(defekt|gedim|daužt|dauzt|pažeidim|pazeidim|avarij)\w*"
-    r"|\bned[aа]u[žz]\w*|\bnebuvo\s+daužt\w*|\bnot\s+damaged\b|\bno\s+damage\b",
-    re.I)
-
-FLAG_PATTERNS = {
-    "damaged": r"\bdaužt\w*|\bdauzt\w*|\bdaužyt\w*|po\s+avarijos|\bavarin\w*|\bdefekt\w*"
-               r"|\bgedim\w*|\bsugedu\w*|\bsugedęs|\bremontui\b|reikia\s+remonto"
-               r"|reikalauja\s+remonto|\bбит(ый|ая|ое)\b|\bdamaged\b|\baccident\b",
-    "not running": r"neužsiveda|neuzsiveda|nevažiuoja|nevaziuoja|nesiveda|не\s+заводится"
-                   r"|\bnot\s+running\b|does\s+not\s+start|neveikia\s+variklis",
-    "no inspection": r"\bbe\s+t\.?\s?a\.?(?=\W|$)|ta\s+negalioja|nėra\s+ta\b|be\s+techninės",
-    "export": r"\beksportui\b|\bexport\b|\bэкспорт\w*",
-    "parts": r"\bdalimis\b|\bardom\w*|\bna\s+zapchasti\b|на\s+запчасти|\bfor\s+parts\b",
-    "lease transfer": r"lizing\w*\s+(perėmim|perimim|perleid)\w*|perimti\s+lizing\w*"
-                      r"|perimamas\s+lizing\w*",
-    "no documents": r"be\s+dokument\w*|be\s+registracijos|išregistruot\w*|neregistruot\w*",
-}
-FLAG_RES = {name: re.compile(p, re.I) for name, p in FLAG_PATTERNS.items()}
-
-
-def text_flags(*texts):
-    """Problem keywords found in a title / description. Edit FLAG_PATTERNS freely:
-    flags are recomputed on every run, so nothing has to be re-fetched."""
-    text = NEGATIONS_RE.sub(" ", " ".join(t for t in texts if t))
-    return [name for name, rx in FLAG_RES.items() if rx.search(text)]
-
-
-# --------------------------------------------------------------------------- #
 # Pooled price model
 # --------------------------------------------------------------------------- #
 # One model over every car instead of one per group. The per-group fit above
@@ -309,7 +276,6 @@ POOLED_CATEGORICAL = ("make_model", "gen_key", "fuel", "gearbox", "body", "sourc
 LEGACY_FEATURES = ("make_model", "gen_key", "fuel", "gearbox", "body",
                    "year", "km", "engine", "kw", "dealer", "damaged")
 POOLED_NUMERIC = ("year", "km", "engine", "kw", "dealer", "damaged")
-IMPLAUSIBLE_SHARE = 0.3
 
 
 def _float(value):
@@ -854,6 +820,26 @@ def sold_summary(cars, groups):
     }
 
 
+def verdict_summary(cars):
+    """Per verdict: how many cars, how many you labelled, how many of those you
+    agreed with, and how fast they disappeared (median days listed, measured
+    cars only). The last is the market's own answer: real deals should go
+    fastest."""
+    rows = []
+    for verdict in (*VERDICTS, None):
+        members = [c for c in cars if c.get("verdict") == verdict]
+        labelled = [c for c in members if c.get("label")]
+        days = [c["days"] for c in members if c["gone"] and c["days"] is not None]
+        rows.append({
+            "verdict": verdict or "not a candidate", "n": len(members),
+            "labelled": len(labelled),
+            "agreed": sum(1 for c in labelled if label_agrees(c["label"], verdict)),
+            "gone_n": len(days),
+            "gone_days": round(statistics.median(days), 1) if days else None,
+        })
+    return rows
+
+
 def model_series(cars, min_n):
     per = defaultdict(lambda: defaultdict(list))
     for c in cars:
@@ -967,6 +953,10 @@ HTML = r"""<!doctype html>
   .pill.fit{background:var(--good);color:#fff}
   .pill.odd{background:var(--warn);color:#231a15}
   .pill.flag{background:var(--bad);color:#fff}
+  .pill.good-pill{background:var(--good);color:#fff}
+  .pill.you{background:var(--series-1);color:#fff}
+  .labels{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px}
+  .labels button.on{background:var(--series-1);border-color:var(--series-1);color:#fff}
   .mini{display:flex;gap:14px;flex-wrap:wrap}
   .mini table{width:auto;min-width:200px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
   .mini td{border:0;padding:3px 8px}
@@ -1011,7 +1001,7 @@ HTML = r"""<!doctype html>
   <button class="tab" role="tab" id="t-groups" aria-controls="p-groups" data-p="groups" aria-selected="false" tabindex="-1">Groups</button>
   <button class="tab" role="tab" id="t-chart" aria-controls="p-chart" data-p="chart" aria-selected="false" tabindex="-1">Price by year</button>
   <button class="tab" role="tab" id="t-drops" aria-controls="p-drops" data-p="drops" aria-selected="false" tabindex="-1">Price drops</button>
-  <button class="tab" role="tab" id="t-sold" aria-controls="p-sold" data-p="sold" aria-selected="false" tabindex="-1">Sold speed</button>
+  <button class="tab" role="tab" id="t-sold" aria-controls="p-sold" data-p="sold" aria-selected="false" tabindex="-1">Verdicts &amp; sold speed</button>
 </nav>
 
 <div class="bar" id="filters">
@@ -1030,8 +1020,16 @@ HTML = r"""<!doctype html>
 
 <section class="panel" id="p-cars" role="tabpanel" aria-labelledby="t-cars">
   <div class="bar">
-    <label class="toggle"><input type="checkbox" id="hideSus" checked>Hide flagged&nbsp;<span id="susCount" class="muted"></span></label>
-    <label class="toggle"><input type="checkbox" id="hideOdd" checked>Hide price outliers&nbsp;<span id="oddCount" class="muted"></span></label>
+    <select id="verdictSel" aria-label="Verdict">
+      <option value="" data-name="Deals, unchecked and other cheap cars">Deals, unchecked and other cheap cars</option>
+      <option value="deal" data-name="Deals">Deals</option>
+      <option value="unchecked" data-name="Unchecked">Unchecked</option>
+      <option value="damaged" data-name="Damaged">Damaged</option>
+      <option value="problem" data-name="Problem">Problem</option>
+      <option value="not a real price" data-name="Not a real price">Not a real price</option>
+      <option value="labelled" data-name="Labelled by you">Labelled by you</option>
+      <option value="all" data-name="Everything under expected">Everything under expected</option>
+    </select>
     <span class="spacer"></span>
     <span class="count" id="carsCount"></span>
   </div>
@@ -1040,12 +1038,18 @@ HTML = r"""<!doctype html>
     <p><strong>vs low end</strong> is how far the price sits under the bottom of that range:
     positive means cheaper than 9 in 10 comparable cars. Click a row for the seller's
     description and every detail.</p>
-    <p><strong>Flagged</strong> = a defect declared on Autoplius (Daužtas, engine or gearbox
-    defect, hail…) or problem words in the seller's text (not running, no TA, export, parts,
-    lease transfer). Text flags exist only where a description was fetched — run
-    <em>Check top candidates</em> in the dashboard, then rebuild the report.</p>
-    <p><strong>Price outliers</strong> sit so far outside their group, or under 30% of expected,
-    that they are almost always parts cars, typos or lease figures.</p>
+    <p><strong>Verdicts.</strong> <span class="pill good-pill">deal</span> under the low end,
+    ad read, nothing found · <span class="pill">unchecked</span> under the low end, ad not read
+    yet · <span class="pill flag">damaged</span> a defect declared on the site ·
+    <span class="pill flag">problem</span> problem words in the seller's text (not running,
+    no TA, export, parts, lease transfer) · <span class="pill odd">not a real price</span>
+    under 30% of expected or far outside its group: a lease figure, deposit, typo or parts car.
+    Unchecked cars become one of the others once their ad is read: the nightly job reads the
+    best ones, and <em>Check top candidates</em> in the dashboard does it on demand.</p>
+    <p><strong>Your verdict.</strong> Open a car and mark it <em>real deal</em>,
+    <em>damaged</em> or <em>fake price</em>. Your label overrides the verdict in this list,
+    is kept in the database, and the <em>Verdicts</em> tab shows how often the two agree.
+    Saving labels works when the report is opened from the dashboard.</p>
   </details>
   <div class="tablebox"><table id="cars"><thead><tr>
     <th data-k="car">Car</th>
@@ -1140,12 +1144,43 @@ const detailRow = (c, cols) => {
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
     d ? `<div class="desc">${esc(d)}</div>`
       : `<div class="muted">${c[C.description_checked] ? "The seller wrote no description."
-        : "Description not fetched yet — run “Check top candidates” in the dashboard."}</div>`}</td></tr>`;
+        : "Description not fetched yet — run “Check top candidates” in the dashboard."}</div>`}
+    ${labelButtons(c)}</td></tr>`;
 };
+const labelButtons = c => `<div class="labels" data-key="${esc(c[C.src]+"|"+c[C.aid])}">
+  <span class="muted">Your verdict:</span>${["deal", "damaged", "fake"].map(l =>
+    `<button data-label="${l}" class="${c[C.label] === l ? "on" : ""}">${LABEL_NAMES[l]}</button>`
+  ).join("")}<button data-label="" ${c[C.label] ? "" : "hidden"}>clear</button>
+  <span class="muted labelmsg"></span></div>`;
+const CARMAP = {}; DATA.cars.forEach(c => CARMAP[c[C.src]+"|"+c[C.aid]] = c);
+/* Save a label through the dashboard (the report is served from it). */
+async function labelCar(btn){
+  const box = btn.closest(".labels"), c = CARMAP[box.dataset.key];
+  const label = btn.dataset.label, msg = box.querySelector(".labelmsg");
+  if (location.protocol === "file:") {
+    msg.textContent = "Open the report from the dashboard to save labels."; return;
+  }
+  try {
+    const r = await fetch("/api/action", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: "label", source: c[C.src], id: c[C.aid], label})});
+    const j = await r.json();
+    if (!r.ok) throw Error(j.message || r.status);
+    c[C.label] = label;
+    box.querySelectorAll("button[data-label]").forEach(b => {
+      b.classList.toggle("on", !!label && b.dataset.label === label);
+      if (b.dataset.label === "") b.hidden = !label;
+    });
+    msg.textContent = j.message;
+  } catch (e) { msg.textContent = "Not saved: " + e.message; }
+}
 /* Clicking a car row opens its detail row; links still just open. */
 function wireExpand(id){
   document.querySelector(`#${id} tbody`).onclick = e => {
     if (e.target.closest("a")) return;
+    const btn = e.target.closest("button[data-label]");
+    if (btn) { labelCar(btn); return; }
+    if (e.target.closest("tr.detail")) return;
     const tr = e.target.closest("tr.click");
     if (tr && tr.nextElementSibling && tr.nextElementSibling.classList.contains("detail")) {
       tr.nextElementSibling.hidden = !tr.nextElementSibling.hidden;
@@ -1160,6 +1195,15 @@ const gonePill = c => c[C.gone] ? '<span class="pill gone">gone</span>' : "";
 const oddPill = c => c[C.odd] ? '<span class="pill odd" title="price excluded from this'
   + ' group\'s percentiles as an outlier — usually a parts car, a typo, or a lease figure'
   + ' parsed as a price">outlier</span>' : "";
+const LABEL_NAMES = {deal: "real deal", damaged: "damaged", fake: "fake price"};
+const LABEL_VERDICT = {deal: "deal", damaged: "damaged", fake: "not a real price"};
+const VERDICT_CLASS = {deal: "good-pill", unchecked: "", damaged: "flag", problem: "flag",
+                       "not a real price": "odd"};
+/* Your label wins over the computed verdict wherever the two differ. */
+const effVerdict = c => LABEL_VERDICT[c[C.label]] || c[C.verdict] || "";
+const verdictPill = c => (c[C.verdict] ? `<span class="pill ${VERDICT_CLASS[c[C.verdict]]}">${
+    esc(c[C.verdict])}</span>` : "")
+  + (c[C.label] ? `<span class="pill you" title="your label">you: ${esc(LABEL_NAMES[c[C.label]])}</span>` : "");
 const flagPill = c => !c[C.flags] ? "" : c[C.flags].split("|").map(f =>
   `<span class="pill flag" title="declared on Autoplius or found in the seller's text">${esc(f)}</span>`).join("");
 /* r.vs is "percent UNDER the baseline", so positive means cheaper. The sign has
@@ -1188,6 +1232,9 @@ document.getElementById("sub").textContent =
   + ` · ${DATA.meta.groups} groups of `
   + `${DATA.meta.min_n}+ cars · ${DATA.meta.gen_groups} grouped by generation · `
   + `${DATA.meta.skipped_total} listings skipped · generated ${DATA.meta.generated}`;
+const VS = Object.fromEntries(DATA.meta.verdicts.map(r => [r.verdict, r]));
+const LABELLED = DATA.meta.verdicts.reduce((a, r) => a + r.labelled, 0);
+const AGREED = DATA.meta.verdicts.reduce((a, r) => a + r.agreed, 0);
 document.getElementById("tiles").innerHTML=[
   ["Listings",DATA.meta.cars.toLocaleString(),`${DATA.meta.models} models · ${DATA.meta.groups} groups`],
   ["Median price",eur(DATA.meta.median),"across every priced listing"],
@@ -1199,9 +1246,13 @@ document.getElementById("tiles").innerHTML=[
      + `Typical miss on a clean car ±${DATA.meta.pooled.err}%; p10-p90 ranges calibrated to hold 80% of cars.`]
   : ["Modelled cars",DATA.meta.priced.toLocaleString(),
      `${DATA.meta.fitted} of ${DATA.meta.groups} groups earned a km+year price model; the rest use their median.`],
-  ["Flagged",DATA.meta.suspect.toLocaleString(),
-   `${DATA.meta.declared} declared defects on Autoplius, the rest from problem words in seller text. `
-   + `The damaged-only search has covered ${DATA.meta.damage_checked.toLocaleString()} cars.`],
+  ["Deals", (VS.deal ? VS.deal.n : 0).toLocaleString(),
+   `Under the low end of their range, ad read, nothing found. `
+   + `${(VS.unchecked ? VS.unchecked.n : 0).toLocaleString()} more are unchecked; `
+   + `${["damaged","problem","not a real price"].map(v => `${VS[v] ? VS[v].n : 0} ${v}`).join(", ")}.`],
+  ["Your checks", LABELLED ? `${Math.round(AGREED / LABELLED * 100)}% agree` : "none yet",
+   LABELLED ? `${LABELLED} cars labelled by you; the verdict agreed on ${AGREED}.`
+            : "Open a car and mark it real deal, damaged or fake price."],
   ["Price cuts seen",DATA.meta.drops,"listings whose asking price fell since first seen"],
   ["Disappeared",DATA.meta.sold.gone,"listings that stopped appearing while their model was still scraped"],
 ].map(([l,v,t])=>`<div class="tile" title="${esc(t)}"><div class="v">${v}</div>
@@ -1293,8 +1344,7 @@ document.querySelectorAll("#filters input").forEach(e=>e.oninput=debounced);
 document.getElementById("fuel").onchange=readFilters;
 document.getElementById("gearSel").onchange=readFilters;
 document.getElementById("siteSel").onchange=readFilters;
-document.getElementById("hideOdd").onchange=()=>drawCars();
-document.getElementById("hideSus").onchange=()=>drawCars();
+document.getElementById("verdictSel").onchange=()=>drawCars();
 document.getElementById("reset").onclick=()=>{
   clearTimeout(debounceT);
   document.querySelectorAll("#filters input,#filters select").forEach(e=>e.value="");
@@ -1397,7 +1447,7 @@ function drawDrill(){
    <th class="num" data-k="km">km</th><th></th>
    </tr></thead><tbody></tbody></table></div>`;
   paint("drilltbl",rows,r=>`<tr class="click"><td class="num">${r.year}</td>
-      <td class="main"><strong>${eur(r.price)}</strong>${oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}
+      <td class="main"><strong>${eur(r.price)}</strong>${verdictPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}
         ${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}<span class="s">${spec(r.c)}</span></td>
       ${baseCell(r)}${vsCell(r.vs)}
       <td class="num">${num(r.km)}${r.kmr?`<span class="s">${r.kmr}× group</span>`:""}</td>
@@ -1437,26 +1487,31 @@ function groupStats(g){
 }
 
 /* ---------- cars (candidates) ---------- */
+const BAD = new Set(["damaged", "problem", "not a real price"]);
 function drawCars(){
-  const hide=document.getElementById("hideOdd").checked;
-  const hideSus=document.getElementById("hideSus").checked;
-  const rows=[]; let odd=0, sus=0;
+  const sel = document.getElementById("verdictSel"), want = sel.value;
+  const rows = [], counts = {all: 0, labelled: 0}; let shownByDefault = 0;
   for(const c of DATA.cars){
     if(!match(c))continue;
     const g=GMAP[gkey(c)];
     if(!g && c[C.exp]==null)continue;
     const r=carRow(c,g);
     if(!(r.vs>0))continue;
-    if(c[C.odd]){odd++; if(hide)continue;}
-    if(c[C.flags]){sus++; if(hideSus)continue;}
-    rows.push(r);
+    const v = effVerdict(c);
+    counts.all++; counts[v] = (counts[v] || 0) + 1;
+    if (!BAD.has(v)) shownByDefault++;
+    if (c[C.label]) counts.labelled++;
+    const keep = want === "" ? !BAD.has(v) : want === "all" ? true
+      : want === "labelled" ? !!c[C.label] : v === want;
+    if (keep) rows.push(r);
   }
-  document.getElementById("oddCount").textContent = `(${odd.toLocaleString()})`;
-  document.getElementById("susCount").textContent = `(${sus.toLocaleString()})`;
+  /* counts on the dropdown itself, for the current filters */
+  [...sel.options].forEach(o => o.textContent =
+    `${o.dataset.name} (${(o.value === "" ? shownByDefault : counts[o.value] || 0).toLocaleString()})`);
   paint("cars",rows,r=>`<tr class="click">
       <td class="main"><strong>${esc(cap(r.c[C.make]))} ${esc(mname(r.c[C.model]))}</strong>${
         r.g&&r.g.is_gen?`<span class="pill gen">${esc(r.g.gen)}</span>`:""}${
-        oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
+        verdictPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
         <span class="s">${spec(r.c)||"&nbsp;"}</span></td>
       <td class="num">${r.year}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
@@ -1490,17 +1545,38 @@ wireSort("cars",()=>drawCars());
 wireSort("drops",()=>drawDrops());
 
 /* ---------- sold speed ---------- */
+/* How each verdict holds up: against your labels, and against the market
+   (how fast its cars disappear once listings are seen more than once). */
+function verdictTable(){
+  const rows = DATA.meta.verdicts.map(r => `<tr><td>${r.verdict === "not a candidate"
+      ? '<span class="muted">not a candidate</span>'
+      : `<span class="pill ${VERDICT_CLASS[r.verdict] || ""}">${esc(r.verdict)}</span>`}</td>
+    <td class="num">${r.n.toLocaleString()}</td>
+    <td class="num">${r.labelled || "—"}</td>
+    <td class="num">${r.labelled ? Math.round(r.agreed / r.labelled * 100) + "%" : "—"}</td>
+    <td class="num">${r.gone_n || "—"}</td>
+    <td class="num">${r.gone_days ?? "—"}</td></tr>`).join("");
+  return `<h3 style="margin:4px 0 8px">Verdicts</h3>
+    <div class="tablebox" style="flex:none;margin-bottom:14px"><table><thead><tr>
+    <th>Verdict</th><th class="num">Cars</th><th class="num">Labelled by you</th>
+    <th class="num">You agreed</th><th class="num">Gone (timed)</th>
+    <th class="num">Median days listed</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="note">“You agreed” counts a <em>damaged</em> label as agreeing with both
+    <em>damaged</em> and <em>problem</em>. Real deals should show the shortest median days
+    listed once the same cars have been seen in a few scrapes.</div>`;
+}
 function drawSold(){
   const s=DATA.meta.sold;
   const box=document.getElementById("soldbox");
+  const prefix = verdictTable();
   if(!s.gone){
-    box.innerHTML=`<div class="note">Nothing has disappeared yet. This view needs at
+    box.innerHTML=prefix+`<div class="note">Nothing has disappeared yet. This view needs at
       least two scrapes a few days apart &mdash; then it shows how long cars stay listed,
       which is the only real feedback on whether your baselines are any good.</div>`;
     return;
   }
   if(!s.cheap_n && !s.dear_n){
-    box.innerHTML=`<div class="tiles">
+    box.innerHTML=prefix+`<div class="tiles">
       <div class="tile"><div class="v">${s.gone}</div><div class="l">Listings gone</div></div>
       <div class="tile"><div class="v">${s.unmeasured}</div>
         <div class="l">of those, seen in only one scrape</div></div></div>
@@ -1514,7 +1590,7 @@ function drawSold(){
     return;
   }
   const faster = s.cheap_days!=null && s.dear_days!=null && s.cheap_days<s.dear_days;
-  box.innerHTML=`<div class="tiles">
+  box.innerHTML=prefix+`<div class="tiles">
     <div class="tile"><div class="v">${s.gone}</div><div class="l">Listings gone</div></div>
     <div class="tile"><div class="v">${s.cheap_days??"—"}</div>
       <div class="l">Median days listed &mdash; priced BELOW group median (${s.cheap_n})</div></div>
@@ -1648,7 +1724,13 @@ def main():
     cols = ["make", "model", "grp", "year", "price", "km", "fuel", "engine",
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
-            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also"]
+            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also",
+            "aid", "verdict", "label"]
+    con = sqlite3.connect(args.db)
+    try:
+        labels = load_labels(con)
+    finally:
+        con.close()
     prefix = "https://autoplius.lt/skelbimai/"
     packed = []
     for c in cars:
@@ -1661,6 +1743,10 @@ def main():
             exp = expected_price(g["fit"], c["mileage_km"], c["year"]) if g else None
             lo = hi = None
         c["exp"], c["lo"] = exp, lo
+        c["verdict"] = classify(c["price_eur"], lo, exp, c["suspect_declared"], c["flags"],
+                                read=bool(c.get("description_checked_at")),
+                                outlier=bool(c.get("price_outlier")))
+        c["label"] = labels.get((c["source"], c["id"]))
         packed.append([
             c["make"], c["model"], c["grp"], c["year"], c["price_eur"],
             c["mileage_km"], c["fuel"] or "", c["engine_l"] or "",
@@ -1674,16 +1760,16 @@ def main():
             c.get("power_kw"), c.get("gearbox") or "", c.get("body") or "",
             "|".join(c["flags"]), c.get("location") or "", c.get("dealer"), c["source"],
             # the same car elsewhere: "site|price|link", several joined by "~"
-            "~".join(f"{o['source']}|{o['price_eur']}|{o['link']}" for o in c.get("also", []))])
+            "~".join(f"{o['source']}|{o['price_eur']}|{o['link']}" for o in c.get("also", [])),
+            c["id"], c["verdict"] or "", c["label"] or ""])
 
-    # Cheapest-looking cars nobody has read yet: these are what the targeted
-    # description fetch (scrape.py --ids-file) should spend requests on.
-    # Already-flagged cars are left out — they have their answer.
+    # The "unchecked" cars, best first: what the targeted description fetch
+    # (scrape.py --ids-file) should spend its requests on. Reading their ads
+    # turns each into a deal, damaged or problem verdict.
     def under(c):
         base = c["lo"] or c["exp"]
         return (base - c["price_eur"]) / base if base else None
-    unread = [c for c in cars if not c["suspect"] and not c.get("price_outlier")
-              and not c.get("description_checked_at") and (under(c) or 0) > 0]
+    unread = [c for c in cars if c["verdict"] == "unchecked"]
     unread.sort(key=under, reverse=True)
     cand_path = Path(args.candidates_file)
     cand_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1716,6 +1802,7 @@ def main():
             "bad_mileage": bad_mileage,
             "pooled": pooled,
             "suspect": sum(1 for c in cars if c["suspect"]),
+            "verdicts": verdict_summary(cars),
             "declared": sum(1 for c in cars if c["suspect_declared"]),
             "damage_checked": sum(1 for c in cars if c.get("damaged") is not None),
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),

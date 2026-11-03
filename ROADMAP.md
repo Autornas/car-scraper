@@ -230,6 +230,15 @@ at ±13.2%.
 **Done when:** a car posted on both sites appears as one row with two links.
 
 ### Phase 6 — Bargain vs crashed: sharper classification (M)
+**Status: done 2026-11-04**, except 6.2 (AI reading of descriptions), which
+is left for you to decide (it costs per ad). Verdicts are computed in
+`collectors/verdicts.py` for the report and the watcher alike; labels come
+from buttons in the report and the dashboard; the Verdicts tab measures
+agreement and median days listed per verdict. On current data: 36 deals,
+4,520 unchecked, 19 damaged, 15 problem, 1,653 not a real price. "Unchecked"
+shrinks as the nightly job reads 150 ads per site and the first complete
+damage sweep runs. The "agree on a spot check of 50" check is yours: label 50
+cars from the Deals list and read the agreement on the Verdicts tab.
 Today a car is either "flagged" or not. The goal is a clear verdict on every
 candidate:
 

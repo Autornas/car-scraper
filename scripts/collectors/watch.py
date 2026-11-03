@@ -21,12 +21,15 @@ up on the dashboard.
 `site` is a site module (collectors.autoplius); see scripts/watch.py.
 """
 
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 from collectors.common import DATA_DIR, BlockDetector, fetch, name_slug, normalized_label
 from collectors.dupes import same_car_elsewhere
+from collectors.verdicts import IMPLAUSIBLE_SHARE, classify, text_flags
+from collectors.verdicts import SCHEMA as LABELS_SCHEMA
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch_scans (
@@ -205,16 +208,12 @@ def verdict(price, lo, mid, details=None, title=None, description=None, read=Fal
       deal              nothing found after reading the ad
       unchecked         cheap, but the ad wasn't read
     """
-    from autoplius_stats import IMPLAUSIBLE_SHARE, text_flags
     if mid and price < IMPLAUSIBLE_SHARE * mid:
         return "not a real price", []
     damage = (details or {}).get("damage_type")
     flags = ([damage] if damage else []) + text_flags(title, description)
-    if damage:
-        return "damaged", flags
-    if flags:
-        return "problem", flags
-    return ("deal" if read else "unchecked"), flags
+    # the same rules the report uses (collectors.verdicts.classify)
+    return classify(price, lo, mid, bool(damage), flags, read) or "unchecked", flags
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +225,16 @@ def verdict(price, lo, mid, details=None, title=None, description=None, read=Fal
 # --------------------------------------------------------------------------- #
 
 
+def ensure_tables(conn):
+    """Create the watcher's tables, and bring older ones up to date: new_deals
+    gained `also` in Phase 5, and the deals list joins `labels` (Phase 6)."""
+    conn.executescript(SCHEMA)
+    conn.executescript(LABELS_SCHEMA)
+    if "also" not in {r[1] for r in conn.execute("PRAGMA table_info(new_deals)")}:
+        conn.execute("ALTER TABLE new_deals ADD COLUMN also TEXT")
+    conn.commit()
+
+
 class WatchStore:
     """The watcher's tables (watch_scans, watch_seen, new_deals) for one site."""
 
@@ -233,11 +242,7 @@ class WatchStore:
         self.store, self.source = store, source
         self.db = store.site(source)
         with store.lock:
-            store.conn.executescript(SCHEMA)
-            cols = {r[1] for r in store.conn.execute("PRAGMA table_info(new_deals)")}
-            if "also" not in cols:                   # tables from before Phase 5
-                store.conn.execute("ALTER TABLE new_deals ADD COLUMN also TEXT")
-            store.conn.commit()
+            ensure_tables(store.conn)
 
     def model_pairs(self):
         return self.db.canonical_pairs()
@@ -292,8 +297,13 @@ class WatchStore:
 
 def health(conn, source, stale_minutes=15):
     """Watcher health for the dashboard, from watch_scans / new_deals.
-    `conn` is any sqlite3 connection to the main database."""
+    `conn` is any sqlite3 connection to the main database. None if the
+    watcher has never run here."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "watch_scans" not in tables:
+        return None
     try:
+        ensure_tables(conn)          # a database last touched by an older watcher
         last = conn.execute(
             """SELECT started_at, status, pages, new, reached_known, hit_cap, message
                FROM watch_scans WHERE source = ? ORDER BY id DESC LIMIT 1""",
@@ -313,17 +323,21 @@ def health(conn, source, stale_minutes=15):
             "SELECT COALESCE(SUM(new), 0) FROM watch_scans WHERE source = ? AND started_at > ?",
             (source, day_ago)).fetchone()[0]
         deals = conn.execute(
-            """SELECT id, found_at, make, model, title, year, mileage_km, price, lo, mid,
-                      verdict, flags, link, also FROM new_deals
-               WHERE source = ? ORDER BY found_at DESC LIMIT 30""", (source,)).fetchall()
-    except Exception:          # tables not created yet: the watcher never ran
+            """SELECT d.id, d.found_at, d.make, d.model, d.title, d.year, d.mileage_km,
+                      d.price, d.lo, d.mid, d.verdict, d.flags, d.link, d.also, l.label
+               FROM new_deals d LEFT JOIN labels l ON l.source = d.source AND l.id = d.id
+               WHERE d.source = ? ORDER BY d.found_at DESC LIMIT 30""", (source,)).fetchall()
+    except sqlite3.Error as exc:
+        # Reported, not hidden: "never run" for a real error is how the
+        # Phase 5 column change went unnoticed on the dashboard.
+        print(f"Watcher health for {source} failed: {exc}", file=sys.stderr)
         return None
     stale = True
     if last_ok:
         age = (now_utc() - datetime.fromisoformat(last_ok)).total_seconds() / 60
         stale = age > stale_minutes
     keys = ("id", "found_at", "make", "model", "title", "year", "km", "price", "lo",
-            "mid", "verdict", "flags", "link", "also")
+            "mid", "verdict", "flags", "link", "also", "label")
     deals = [{**dict(zip(keys, d)), "source": source} for d in deals]
     return {
         "last": dict(zip(("started_at", "status", "pages", "new", "reached_known",
@@ -402,7 +416,7 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
     """Price new ads; read the ad of each one under its range; record verdicts."""
     if model is None or not rows:
         return 0
-    from autoplius_stats import IMPLAUSIBLE_SHARE, generation_for
+    from autoplius_stats import generation_for
     cheap = 0
     for row in rows:
         if row["price_eur"] == "" or not row["year"]:

@@ -9,6 +9,9 @@ nightly.py — keep the database fresh without anyone pressing a button.
                            site-wide damage sweep
     2. autoplius_stats.py  rebuilds the report and the saved price model, which
                            a running watcher picks up by itself
+    3. scrape.py           reads the ads of up to report.nightly_reads of the best
+                           "unchecked" cars per site, and the report is rebuilt
+                           so they get a real verdict (deal / damaged / problem)
 
 Output goes to data/logs/nightly-YYYY-MM-DD.log. Run it by hand, or let Windows
 run it every night: scripts/install_nightly_task.ps1 registers that.
@@ -34,6 +37,15 @@ STEPS = [(f"refresh {site.SOURCE}",
            "--limit", str(SETTINGS[site.SOURCE]["nightly_limit"])])
          for site in enabled_sites()]
 STEPS.append(("rebuild report and price model", ["autoplius_stats.py"]))
+# Read the ads of the best "unchecked" cars (the report just listed them in
+# the candidates file), then rebuild so they get their real verdicts.
+_reads = SETTINGS["report"]["nightly_reads"]
+if _reads:
+    STEPS.append(("read top unchecked ads",
+                  ["scrape.py", "--backfill-descriptions", "--ids-file",
+                   str(project_path(SETTINGS["paths"]["data_dir"]) / "candidates.txt"),
+                   "--description-limit", str(_reads)]))
+    STEPS.append(("rebuild report with their verdicts", ["autoplius_stats.py"]))
 
 
 def main():

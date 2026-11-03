@@ -17,7 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from collectors import enabled_sites
+from collectors import SITES, enabled_sites
+from collectors.verdicts import LABELS, set_label
 from collectors.store import Store
 from collectors.watch import health as watcher_health
 
@@ -137,6 +138,10 @@ main{flex:1;min-height:0;display:flex}
 .deal .t{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .deal .m{grid-column:1/-1;font-size:12px;color:var(--muted)}
 .deal .p{font-variant-numeric:tabular-nums;font-weight:650}
+.deal .lb{grid-column:1/-1;display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
+.deal .lb button{font-size:12px;padding:2px 8px;font-weight:500}
+.deal .lb button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.v.you{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .v{font-size:11px;font-weight:650;padding:1px 7px;border-radius:99px;white-space:nowrap}
 .v.deal{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
 .v.damaged,.v.problem{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
@@ -405,9 +410,26 @@ function renderWatcher(w,running){
    <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
    <span class="m">${esc(d.source)} · expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
     d.flags?" · "+esc(d.flags.split("|").join(", ")):""}${alsoText(d.also)} · ${ago(d.found_at)} ·
-    <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
+    <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span>
+   <span class="lb" data-source="${esc(d.source)}" data-id="${esc(d.id)}">Your verdict:${
+    Object.entries(LABEL_NAMES).map(([k,n])=>`<button data-label="${k}" class="${d.label===k?"on":""}">${n}</button>`).join("")}${
+    d.label?'<button data-label="">clear</button>':""}</span></div>`;
  }).join(""):'<div class="empty">No new car under its price range yet.</div>';
 }
+const LABEL_NAMES={deal:"real deal",damaged:"damaged",fake:"fake price"};
+/* Label buttons on the New deals list: saved to the labels table, which the
+   report reads too. */
+$("deals").addEventListener("click",async e=>{
+ const b=e.target.closest("button[data-label]");if(!b)return;
+ const box=b.closest(".lb");
+ try{
+  const r=await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({action:"label",source:box.dataset.source,id:box.dataset.id,label:b.dataset.label})});
+  const j=await r.json();
+  if(!r.ok)throw Error(j.message||r.statusText);
+  await refresh();
+ }catch(err){notify("Could not save the label",String(err.message||err));}
+});
 
 const notified=new Set();
 async function refresh(){
@@ -471,6 +493,28 @@ showView(location.hash.slice(1));
 window.addEventListener("hashchange",()=>showView(location.hash.slice(1)));
 loadModels();refresh();setInterval(refresh,2000);
 </script></body></html>"""
+
+
+AD_ID_RE = re.compile(r"[0-9A-Za-z-]{1,40}")
+
+
+def save_label(payload):
+    """Your verdict on one car, from the report or the New deals list:
+    {"source": "autoplius", "id": "32908972", "label": "deal" | "damaged" |
+    "fake" | ""}. An empty label removes yours."""
+    source, ad_id, label = payload.get("source"), payload.get("id"), payload.get("label")
+    if source not in SITES:
+        raise ValueError("Unknown site.")
+    if not isinstance(ad_id, str) or not AD_ID_RE.fullmatch(ad_id):
+        raise ValueError("Invalid listing id.")
+    if label not in (*LABELS, ""):
+        raise ValueError("Unknown label.")
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        set_label(connection, source, ad_id, label)
+    finally:
+        connection.close()
+    return f"Marked as {LABELS[label]}." if label else "Label removed."
 
 
 def save_database_models(text):
@@ -896,6 +940,17 @@ def make_handler(manager):
                     "text": text,
                     "count": count,
                 })
+                return
+            if action == "label":
+                try:
+                    message = save_label(payload)
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "message": str(exc)})
+                    return
+                except sqlite3.Error as exc:
+                    self._send_json(500, {"ok": False, "message": f"Could not save: {exc}"})
+                    return
+                self._send_json(200, {"ok": True, "message": message})
                 return
             if action == "stop":
                 ok, message = manager.stop()

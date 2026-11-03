@@ -147,6 +147,29 @@ def test_old_new_deals_table_gains_the_column(tmp_path):
     store.close()
 
 
+def test_health_reads_a_database_last_touched_by_an_older_watcher(tmp_path):
+    # Regression: the dashboard showed "never run" because health() selected
+    # the Phase 5 column from a table the watcher hadn't upgraded yet.
+    con = sqlite3.connect(tmp_path / "t.db")
+    old_deals = w.SCHEMA.split("CREATE TABLE IF NOT EXISTS new_deals")[0]
+    con.executescript(old_deals)
+    con.executescript("""CREATE TABLE new_deals (source TEXT, id TEXT, found_at TEXT,
+        make TEXT, model TEXT, title TEXT, year INTEGER, mileage_km INTEGER, price INTEGER,
+        lo INTEGER, mid INTEGER, hi INTEGER, verdict TEXT, flags TEXT, link TEXT,
+        PRIMARY KEY (source, id));
+        INSERT INTO watch_scans (source, started_at, status, pages, new, reached_known, hit_cap)
+            VALUES ('autoplius', '2026-11-03T18:28:26+00:00', 'ok', 3, 5, 1, 0);
+        INSERT INTO new_deals VALUES ('autoplius', '1', '2026-11-03T18:28:26+00:00', 'bmw',
+            '320', 'BMW 320', 2015, 1, 7000, 8000, 10000, 12000, 'deal', '', 'https://x/1');""")
+    h = w.health(con, "autoplius")
+    assert h["last"]["new"] == 5 and h["deals"][0]["id"] == "1"
+    assert h["deals"][0]["also"] is None and h["deals"][0]["label"] is None
+
+
+def test_health_is_none_where_the_watcher_never_ran():
+    assert w.health(sqlite3.connect(":memory:"), "autoplius") is None
+
+
 # --------------------------------------------------------------------------- #
 # saved price model compatibility
 # --------------------------------------------------------------------------- #

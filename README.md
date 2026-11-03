@@ -21,10 +21,10 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   make/model catalogue with id-based searches; site-wide damage sweep;
   multi-site database and shared collector code; autogidas.lt collector
   (full scrape per make, damage sweep, watcher, ad pages).
-- **In progress:** the first full pass over both sites (Autoplius
-  rate-limited a faster pass; both now run at one request every ~2 s).
-- **Not started:** verdicts with admin feedback, multi-user website, hosting,
-  alerts.
+- **In progress:** the first full pass over both sites. Both sites
+  rate-limit long runs, so the nightly job finishes it a few hundred models a
+  night.
+- **Not started:** multi-user website, hosting, alerts.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
@@ -40,8 +40,9 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   sweep (`f_46`), watcher (`f_50=naujausi_desc`), ad pages.
 - [x] **5. Combine sites:** the same car on both sites is matched, counted
   once, and shown as one row with a link to the other listing.
-- [ ] **6. Verdicts:** Deal / Damaged / Problem / Not a real price /
-  Unchecked, with admin feedback.
+- [x] **6. Verdicts:** deal / unchecked / damaged / problem / not a real
+  price on every cheap car, your own labels from the report and dashboard,
+  agreement and sold-speed per verdict.
 - [ ] **7. Web server:** FastAPI, admin and viewer roles, paginated data,
   alerts.
 - [ ] **8. Go live:** Cloudflare Tunnel + Access, Windows service, backups,
@@ -104,6 +105,34 @@ from other sites are filed under it by matching their card titles against it
 ("Mercedes-Benz C 220 T CDI" -> `mercedes-benz/c220`), so the price model
 treats a car the same whichever site it came from. `model_aliases` is there
 for a site's own names that need mapping by hand.
+
+### Verdicts and your labels
+
+Every car priced under what the model expects gets one verdict
+(`scripts/collectors/verdicts.py`, the same rules in the report and the
+watcher):
+
+| Verdict | Meaning |
+|---|---|
+| **deal** | under the low end of its range (p10), ad read, nothing found |
+| **unchecked** | under the low end, ad not read yet |
+| **damaged** | a defect declared on the site |
+| **problem** | problem words in the seller's text (not running, no TA, export, parts, lease transfer) |
+| **not a real price** | under 30% of expected or far outside its group: lease figure, deposit, typo, parts car |
+
+The Deals tab filters by verdict; the default hides damaged, problem and
+fake prices. Open a car and mark it **real deal**, **damaged** or **fake
+price**; the New deals list on the dashboard has the same buttons. Labels are
+kept in the `labels` table, override the verdict in the list, and the
+**Verdicts & sold speed** tab shows how often you agreed with each verdict and
+how fast each verdict's cars disappear. Saving labels works when the report is
+opened from the dashboard.
+
+By definition about 10% of cars sit under their p10, so "unchecked" is
+large. Its best (furthest under) cars are read first: the nightly job reads
+`report.nightly_reads` (150) ads per site, and **Check top candidates** in the
+dashboard does it on demand. The site-wide damage sweep, which runs after
+each complete scrape, turns many of them into **damaged** directly.
 
 ### The same car on two sites
 

@@ -55,6 +55,7 @@ DEFAULTS = {
         "bucket": 3,
         "min_n": 5,
         "candidates": 300,
+        "nightly_reads": 150,
         "pooled": True,
     },
     "dashboard": {
