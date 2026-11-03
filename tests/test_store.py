@@ -111,6 +111,18 @@ def test_gone_is_per_site(tmp_path):
     store.close()
 
 
+def test_gone_for_a_site_searched_per_make(tmp_path):
+    store = Store(tmp_path / "t.db")
+    store.site("autogidas").upsert_many([row("1"), row("2")], "bmw", "320")
+    store.conn.execute("UPDATE listings SET last_seen = '2026-11-01T00:00:00+00:00' WHERE id = '1'")
+    store.conn.execute("UPDATE listings SET last_seen = '2026-11-03T00:30:00+00:00' WHERE id = '2'")
+    store.conn.execute("""INSERT INTO models (url, source, make, model, last_scraped)
+                          VALUES ('u', 'autogidas', 'bmw', '*', '2026-11-03T01:00:00+00:00')""")
+    store.conn.commit()
+    assert find_gone(store) == [("autogidas", "1")]
+    store.close()
+
+
 def test_damage_sweep_is_per_site(tmp_path):
     store = Store(tmp_path / "t.db")
     for source in ("autoplius", "autogidas"):

@@ -732,7 +732,9 @@ def mark_disappeared(cars, scraped):
     for c in cars:
         seen = parse_ts(c["last_seen"])
         first = parse_ts(c["first_seen"])
-        ref = scraped.get((c["source"], c["make"], c["model"]))
+        # sites searched per make (autogidas) record one "*" model per make
+        ref = scraped.get((c["source"], c["make"], c["model"])) \
+            or scraped.get((c["source"], c["make"], "*"))
         c["gone"] = bool(seen and ref and (ref - seen).total_seconds() > 3600)
         # A listing seen in only ONE scrape carries no duration information:
         # first_seen == last_seen, so the difference is 0 however long it was
@@ -992,6 +994,7 @@ HTML = r"""<!doctype html>
   <input type="number" id="kmax" placeholder="Max km" aria-label="Maximum mileage">
   <select id="fuel" aria-label="Fuel"><option value="">Any fuel</option></select>
   <select id="gearSel" aria-label="Gearbox"><option value="">Any gearbox</option></select>
+  <select id="siteSel" aria-label="Site"><option value="">Any site</option></select>
   <button id="reset">Reset</button>
   <span class="count" id="fcount"></span>
 </div>
@@ -1211,7 +1214,13 @@ function paint(id,rows,cells,cols,emptyMsg){
 }
 
 /* ---------- filters ---------- */
-const F={q:"",pmin:null,pmax:null,ymin:null,ymax:null,kmax:null,fuel:"",gear:""};
+const F={q:"",pmin:null,pmax:null,ymin:null,ymax:null,kmax:null,fuel:"",gear:"",site:""};
+const SITES=[...new Set(DATA.cars.map(c=>c[C.src]).filter(Boolean))].sort();
+document.getElementById("siteSel").innerHTML='<option value="">Any site</option>'
+  +SITES.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join("");
+document.getElementById("siteSel").hidden = SITES.length < 2;
+/* Which site a car is from, shown only once there is more than one. */
+const sitePill = c => SITES.length > 1 ? `<span class="pill">${esc(c[C.src])}</span>` : "";
 const fuels=[...new Set(DATA.cars.map(c=>c[C.fuel]).filter(Boolean))].sort();
 const gears=[...new Set(DATA.cars.map(c=>c[C.gear]).filter(Boolean))].sort();
 document.getElementById("gearSel").innerHTML='<option value="">Any gearbox</option>'
@@ -1223,6 +1232,7 @@ function readFilters(){
   F.q=document.getElementById("q").value.toLowerCase().trim();
   F.pmin=v("pmin");F.pmax=v("pmax");F.ymin=v("ymin");F.ymax=v("ymax");F.kmax=v("kmax");
   F.fuel=document.getElementById("fuel").value;
+  F.site=document.getElementById("siteSel").value;
   F.gear=document.getElementById("gearSel").value;
   renderAll();
 }
@@ -1235,6 +1245,7 @@ function match(c){
   if(F.kmax!=null && (c[C.km]==null || c[C.km]>F.kmax)) return false;
   if(F.fuel && c[C.fuel]!==F.fuel) return false;
   if(F.gear && c[C.gear]!==F.gear) return false;
+  if(F.site && c[C.src]!==F.site) return false;
   return true;
 }
 let debounceT;
@@ -1242,6 +1253,7 @@ const debounced=()=>{clearTimeout(debounceT);debounceT=setTimeout(readFilters,12
 document.querySelectorAll("#filters input").forEach(e=>e.oninput=debounced);
 document.getElementById("fuel").onchange=readFilters;
 document.getElementById("gearSel").onchange=readFilters;
+document.getElementById("siteSel").onchange=readFilters;
 document.getElementById("hideOdd").onchange=()=>drawCars();
 document.getElementById("hideSus").onchange=()=>drawCars();
 document.getElementById("reset").onclick=()=>{
@@ -1346,7 +1358,7 @@ function drawDrill(){
    <th class="num" data-k="km">km</th><th></th>
    </tr></thead><tbody></tbody></table></div>`;
   paint("drilltbl",rows,r=>`<tr class="click"><td class="num">${r.year}</td>
-      <td class="main"><strong>${eur(r.price)}</strong>${oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}
+      <td class="main"><strong>${eur(r.price)}</strong>${oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}
         ${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}<span class="s">${spec(r.c)}</span></td>
       ${baseCell(r)}${vsCell(r.vs)}
       <td class="num">${num(r.km)}${r.kmr?`<span class="s">${r.kmr}× group</span>`:""}</td>
@@ -1405,7 +1417,7 @@ function drawCars(){
   paint("cars",rows,r=>`<tr class="click">
       <td class="main"><strong>${esc(cap(r.c[C.make]))} ${esc(mname(r.c[C.model]))}</strong>${
         r.g&&r.g.is_gen?`<span class="pill gen">${esc(r.g.gen)}</span>`:""}${
-        oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
+        oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
         <span class="s">${spec(r.c)||"&nbsp;"}</span></td>
       <td class="num">${r.year}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
@@ -1596,7 +1608,7 @@ def main():
     cols = ["make", "model", "grp", "year", "price", "km", "fuel", "engine",
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
-            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer"]
+            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src"]
     prefix = "https://autoplius.lt/skelbimai/"
     packed = []
     for c in cars:
@@ -1620,7 +1632,7 @@ def main():
             1 if c.get("description_checked_at") else 0,
             round(lo) if lo else None, round(hi) if hi else None,
             c.get("power_kw"), c.get("gearbox") or "", c.get("body") or "",
-            "|".join(c["flags"]), c.get("location") or "", c.get("dealer")])
+            "|".join(c["flags"]), c.get("location") or "", c.get("dealer"), c["source"]])
 
     # Cheapest-looking cars nobody has read yet: these are what the targeted
     # description fetch (scrape.py --ids-file) should spend requests on.

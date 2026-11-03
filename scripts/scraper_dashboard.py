@@ -10,7 +10,6 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import time
 import webbrowser
 from collections import deque
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from collectors import enabled_sites
 from collectors.store import Store
 from collectors.watch import health as watcher_health
 
@@ -216,19 +216,19 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
    <h2>Tasks <span class="spacer"></span><span id="notice" style="text-transform:none;letter-spacing:0"></span></h2>
    <div class="group-label">Live</div>
    <div class="task" data-task="watcher"><div class="t"><div class="n">New-listing watcher</div>
-    <div class="d">Reads the newest ads every 5 minutes until it reaches ones it already has, prices them and checks cheap ones for defects.</div>
+    <div class="d">Reads each site's newest ads every 5 minutes until it reaches ones it already has, prices them and checks cheap ones for defects.</div>
     <div class="d health" id="watchHealth"></div></div>
     <button data-action="start_watcher">Start</button></div>
    <div class="group-label">Collect</div>
    <div class="task" data-task="database scraper"><div class="t"><div class="n">Resume scraping</div>
-    <div class="d">Every make and model on Autoplius not scraped in the last 7 days, then the damage sweep.</div></div>
+    <div class="d">Every model (Autoplius) or make (autogidas) not scraped in the last 7 days, then each site's damage sweep.</div></div>
     <button data-action="start_database">Start</button></div>
    <div class="task" data-task="full re-scrape"><div class="t"><div class="n">Full re-scrape</div>
     <div class="d">Every model again, regardless of age — refreshes every price and car detail. About 4 hours at a polite pace.</div></div>
     <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 4 hours.">Start</button></div>
    <div class="group-label">Clean up</div>
    <div class="task" data-task="damage check"><div class="t"><div class="n">Flag damaged cars</div>
-    <div class="d">Autoplius' defect filter across the whole site (~2,300 cars, ~120 pages). ~5 min.</div></div>
+    <div class="d">Each site's own defect filter (Autoplius ~120 pages, autogidas ~40 pages). ~5–10 min.</div></div>
     <button data-action="refresh_damage">Start</button></div>
    <div class="task" data-task="candidate check"><div class="t"><div class="n">Check top candidates</div>
     <div class="d">Rebuilds the deal list, reads the 300 best unread ads for defects, rebuilds again. ~15 min.</div></div>
@@ -261,8 +261,9 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 </section>
 
 <section class="view models" id="v-models" hidden>
- <p>Models the database scraper covers, one <code>make/model</code> per line (for example <code>audi/a3</code>).
- The list starts as every make and model on Autoplius. Remove a line to switch that model off (its saved listings stay); add it back to switch it on. Only names from the site's catalogue are accepted.</p>
+ <p>Autoplius models the database scraper covers, one <code>make/model</code> per line (for example <code>audi/a3</code>).
+ The list starts as every make and model on Autoplius. Remove a line to switch that model off (its saved listings stay); add it back to switch it on. Only names from the site's catalogue are accepted.
+ autogidas.lt is scraped per make and switched on or off as a whole in <code>config.toml</code>.</p>
  <textarea id="modelsText" spellcheck="false" aria-label="Model list"></textarea>
  <div class="bar"><button class="primary" id="saveModels">Save model list</button>
   <span id="modelsStatus" style="color:var(--muted)">Loading…</span></div>
@@ -372,21 +373,23 @@ $("logs").addEventListener("scroll",()=>{
 
 /* ---------- watcher health and deals ---------- */
 const VERDICT={deal:"deal",damaged:"damaged",problem:"problem"};
+/* One health line per site: failing, stale, or its last scan. */
+function siteHealth(src,s,running){
+ if(!s||!s.last)return [`${src}: never run yet`,""];
+ const l=s.last;
+ if(s.failures)return [`${src}: failing — last ${s.failures} scan(s) could not read the site · last good scan ${ago(s.last_ok)}`,"bad"];
+ if(running&&s.stale)return [`${src}: no successful scan for ${ago(s.last_ok).replace(" ago","")} — check the output`,"bad"];
+ return [`${src}: last scan ${ago(l.started_at)} · ${l.new} new on ${l.pages} page(s)`
+   +(l.hit_cap?" · hit the page cap, older ads may be missing":""),l.hit_cap?"bad":"ok"];
+}
 function renderWatcher(w,running){
  const h=$("watchHealth");
- if(!w||!w.last){h.textContent="Never run yet.";h.className="d health";
+ const sites=Object.entries((w&&w.sites)||{});
+ if(!sites.length){h.textContent="Never run yet.";h.className="d health";
   $("deals").innerHTML='<div class="empty">Cars the watcher finds under their price range appear here.</div>';return;}
- const l=w.last;
- if(w.failures){
-  h.textContent=`Failing: last ${w.failures} scan(s) could not read Autoplius · last good scan ${ago(w.last_ok)}`;
-  h.className="d health bad";
- }else if(running&&w.stale){
-  h.textContent=`No successful scan for ${ago(w.last_ok).replace(" ago","")} — check the output`;h.className="d health bad";
- }else{
-  h.textContent=`Last scan ${ago(l.started_at)} · ${l.new} new on ${l.pages} page(s)`
-   +(l.hit_cap?" · hit the page cap, older ads may be missing":"");
-  h.className="d health"+(l.hit_cap?" bad":" ok");
- }
+ const lines=sites.map(([src,s])=>siteHealth(src,s,running));
+ h.innerHTML=lines.map(([t,c])=>`<span class="${c}">${esc(t)}</span>`).join("<br>");
+ h.className="d health";
  const deals=w.deals||[];
  $("dealsNote").textContent=deals.length?`${deals.filter(d=>d.verdict==="deal").length} deals of ${deals.length} recent`:"";
  $("deals").innerHTML=deals.length?deals.map(d=>{
@@ -394,7 +397,7 @@ function renderWatcher(w,running){
   const cls=VERDICT[d.verdict]||"other";
   return `<div class="deal"><span class="t">${esc(d.title)} ${d.year??""}</span>
    <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
-   <span class="m">expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
+   <span class="m">${esc(d.source)} · expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
     d.flags?" · "+esc(d.flags.split("|").join(", ")):""} · ${ago(d.found_at)} ·
     <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
  }).join(""):'<div class="empty">No new car under its price range yet.</div>';
@@ -722,7 +725,14 @@ def database_summary():
                     """SELECT COUNT(*), COUNT(last_scraped), MAX(last_scraped) FROM models"""
                 ).fetchone()
         if "watch_scans" in tables:
-            result["watcher"] = watcher_health(connection, "autoplius")
+            sites = {site.SOURCE: watcher_health(connection, site.SOURCE)
+                     for site in enabled_sites()}
+            deals = sorted((d for h in sites.values() if h for d in h["deals"]),
+                           key=lambda d: d["found_at"], reverse=True)[:40]
+            result["watcher"] = {
+                "sites": sites, "deals": deals,
+                "new_24h": sum(h["new_24h"] for h in sites.values() if h),
+            }
     finally:
         connection.close()
     return result

@@ -2,8 +2,8 @@
 """
 nightly.py — keep the database fresh without anyone pressing a button.
 
-    1. scrape.py           syncs the make/model catalogue (weekly), re-scrapes
-                           up to autoplius.nightly_limit models that are older
+    1. scrape.py           for each enabled site: syncs its catalogue (weekly),
+                           re-scrapes up to <site>.nightly_limit models older
                            than max_age_days (oldest first; models with no ads
                            only every empty_max_age_days), then runs the
                            site-wide damage sweep
@@ -25,12 +25,15 @@ from pathlib import Path
 from settings import SETTINGS, project_path
 
 SCRIPTS = Path(__file__).resolve().parent
-STEPS = [
-    # at most nightly_limit models a night, oldest first: a full refresh
-    # spreads over the week instead of one long burst the site rate-limits
-    ("refresh listings", ["scrape.py", "--limit", str(SETTINGS["autoplius"]["nightly_limit"])]),
-    ("rebuild report and price model", ["autoplius_stats.py"]),
-]
+from collectors import enabled_sites
+
+# Per site, at most nightly_limit models a night, oldest first: a full refresh
+# spreads over the week instead of one long burst the site rate-limits.
+STEPS = [(f"refresh {site.SOURCE}",
+          ["scrape.py", "--site", site.SOURCE,
+           "--limit", str(SETTINGS[site.SOURCE]["nightly_limit"])])
+         for site in enabled_sites()]
+STEPS.append(("rebuild report and price model", ["autoplius_stats.py"]))
 
 
 def main():

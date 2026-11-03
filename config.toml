@@ -18,7 +18,14 @@ description_delay = 2.0  # seconds between ad-page requests
 block_threshold = 8      # consecutive refusals before a run stops
 
 [autogidas]
-enabled = false          # collector arrives in phase 4
+enabled = true           # scrape and watch autogidas.lt too
+delay = 2.0
+concurrency = 1
+max_age_days = 7         # searched per make (~90 makes), so a full pass is ~1,400 pages
+empty_max_age_days = 30
+nightly_limit = 100      # makes per nightly run
+description_delay = 2.0
+block_threshold = 8
 
 [watcher]
 interval_minutes = 5     # time between scan starts

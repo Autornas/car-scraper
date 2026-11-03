@@ -7,6 +7,7 @@ import pytest
 
 from collectors import autoplius as db
 from collectors import watch as w
+from collectors.common import parse_age
 
 
 # --------------------------------------------------------------------------- #
@@ -22,7 +23,7 @@ from collectors import watch as w
     ("TOP", None),
 ])
 def test_parse_age(text, minutes):
-    assert db.parse_age(text) == minutes
+    assert parse_age(text) == minutes
 
 
 def test_card_ages_on_newest_page(page):

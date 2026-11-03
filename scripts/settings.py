@@ -36,6 +36,13 @@ DEFAULTS = {
     },
     "autogidas": {
         "enabled": False,
+        "delay": 2.0,
+        "concurrency": 1,
+        "max_age_days": 7.0,
+        "empty_max_age_days": 30.0,
+        "nightly_limit": 100,
+        "description_delay": 2.0,
+        "block_threshold": 8,
     },
     "watcher": {
         "interval_minutes": 5.0,

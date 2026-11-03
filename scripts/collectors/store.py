@@ -15,13 +15,14 @@ model_aliases (source, site_make, site_model -> make, model); with no alias a
 name is used as it is, which is how Autoplius' names became the canonical ones.
 """
 
-import shutil
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 2
+# The site whose make/model names are the shared ones (see model_aliases).
+CANONICAL_SOURCE = "autoplius"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -227,13 +228,8 @@ class SiteStore:
     # ------------------------------------------------------------ names
     def canonical(self, make, model):
         """The canonical make/model for this site's names (see model_aliases)."""
-        if self._aliases is None:
-            with self.lock:
-                self._aliases = {
-                    (mk, md): (cmk, cmd) for mk, md, cmk, cmd in self.conn.execute(
-                        """SELECT site_make, site_model, make, model FROM model_aliases
-                           WHERE source = ?""", (self.source,))}
-        return self._aliases.get((make, model), (make, model))
+        with self.lock:
+            return self.canonical_unlocked(make, model)
 
     def set_alias(self, site_make, site_model, make, model):
         with self.lock:
@@ -408,10 +404,17 @@ class SiteStore:
         with self.lock:
             for e in entries:
                 url = url_for(e)
-                row = self.conn.execute(
-                    "SELECT rowid FROM models WHERE source = ? AND model_id = ?",
-                    (self.source, e["model_id"])).fetchone()
-                if row is None:
+                row = None
+                if e["model_id"] is not None:
+                    row = self.conn.execute(
+                        "SELECT rowid FROM models WHERE source = ? AND model_id = ?",
+                        (self.source, e["model_id"])).fetchone()
+                if row is None and e["model_id"] is None:
+                    # a site without ids (autogidas): the name is the identity
+                    row = self.conn.execute(
+                        "SELECT rowid FROM models WHERE source = ? AND make = ? AND model = ?",
+                        (self.source, e["make"], e["model"])).fetchone()
+                elif row is None:
                     row = self.conn.execute(
                         """SELECT rowid FROM models WHERE source = ? AND make = ?
                            AND model = ? AND model_id IS NULL""",
@@ -446,7 +449,8 @@ class SiteStore:
     def models_missing_ids(self):
         with self.lock:
             return self.conn.execute(
-                "SELECT COUNT(*) FROM models WHERE source = ? AND model_id IS NULL",
+                """SELECT COUNT(*) FROM models WHERE source = ? AND model_id IS NULL
+                   AND model != '*'""",
                 (self.source,)).fetchone()[0]
 
     def pending_models(self, max_age_days, force, empty_max_age_days=30):
@@ -478,14 +482,15 @@ class SiteStore:
                 "SELECT model FROM models WHERE source = ? AND make = ? ORDER BY model",
                 (self.source, make))]
 
-    def model_pairs(self):
-        """Every make/model this site's listings or catalogue know (site names
-        and canonical names alike), for matching card titles."""
+    def canonical_pairs(self):
+        """Every canonical make/model: the canonical site's catalogue plus every
+        make/model any listing is stored under. Card titles from any site are
+        matched against these, so a car lands under the same name everywhere."""
         with self.lock:
             return self.conn.execute(
-                """SELECT make, model FROM models WHERE source = ?
-                   UNION SELECT DISTINCT make, model FROM listings WHERE source = ?""",
-                (self.source, self.source)).fetchall()
+                """SELECT make, model FROM models WHERE source = ? AND model != '*'
+                   UNION SELECT DISTINCT make, model FROM listings""",
+                (CANONICAL_SOURCE,)).fetchall()
 
     def _set_meta(self, key):
         self.conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)",
@@ -529,7 +534,10 @@ def find_gone(store, source=None):
             (source,) if source else ()).fetchall()
     gone = []
     for src, rid, make, model, last_seen in rows:
-        seen, ref = ts(last_seen), scraped.get((src, make, model))
+        # A site searched per make (autogidas) has one "*" model per make, while
+        # its cars are stored under their real models: the make's scrape counts.
+        seen = ts(last_seen)
+        ref = scraped.get((src, make, model)) or scraped.get((src, make, "*"))
         if seen and ref and (ref - seen).total_seconds() > 3600:
             gone.append((src, rid))
     return gone

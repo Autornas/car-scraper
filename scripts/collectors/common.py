@@ -238,3 +238,19 @@ def load_models_file(path):
             make, model = line.split("/", 1)
             pairs.add(f"{make.strip().lower()}/{model.strip().lower()}")
     return pairs
+
+
+AGE_UNITS = {"min": 1, "val": 60, "d": 1440, "sav": 10080, "mėn": 43200}
+
+
+def parse_age(text):
+    """Minutes since publishing, from a card's badge: "Prieš 1 val. 15 min." -> 75,
+    "Mažiau nei prieš minutę" -> 0. None for anything else (older ads carry no
+    badge at all)."""
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+    if "mažiau nei" in text:
+        return 0
+    parts = re.findall(r"(\d+)\s*(min|val|d|sav|mėn)\b", text)
+    return sum(int(n) * AGE_UNITS[unit] for n, unit in parts) if parts else None

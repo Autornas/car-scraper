@@ -8,9 +8,9 @@ modules do the rest:
     collectors.watch    the gap-free new-listing watcher
 """
 
-from collectors import autoplius
+from collectors import autogidas, autoplius
 
-SITES = {autoplius.SOURCE: autoplius}
+SITES = {autoplius.SOURCE: autoplius, autogidas.SOURCE: autogidas}
 
 
 def enabled_sites():

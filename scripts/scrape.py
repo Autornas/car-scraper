@@ -24,6 +24,7 @@ autoplius.max_age_days (models with no ads: empty_max_age_days).
 import argparse
 import sys
 import time
+from types import SimpleNamespace
 
 import requests
 
@@ -33,7 +34,11 @@ from collectors.common import (STOP, BlockDetector, diagnose, install_sigint_han
 from collectors.store import Store, do_export, do_prune_gone, do_status
 from settings import SETTINGS, project_path
 
-CFG = SETTINGS["autoplius"]
+# Per-site values come from that site's section of config.toml; a flag given
+# on the command line overrides them for every site in the run.
+PER_SITE = ("concurrency", "delay", "max_age", "empty_max_age", "block_threshold",
+            "description_delay")
+CONFIG_KEY = {"max_age": "max_age_days", "empty_max_age": "empty_max_age_days"}
 
 
 def parse_args():
@@ -41,17 +46,17 @@ def parse_args():
     ap.add_argument("--site", action="append", default=None,
                     help="only this site (repeatable); default: every enabled site")
     ap.add_argument("--db", default=str(project_path(SETTINGS["paths"]["database"])))
-    ap.add_argument("--concurrency", type=int, default=CFG["concurrency"])
-    ap.add_argument("--delay", type=float, default=CFG["delay"])
+    ap.add_argument("--concurrency", type=int, default=None)
+    ap.add_argument("--delay", type=float, default=None)
     ap.add_argument("--max-pages", type=int, default=200)
     ap.add_argument("--cap-threshold", type=int, default=3900,
                     help="a search returning this many is assumed capped")
     ap.add_argument("--min-width", type=int, default=50)
     ap.add_argument("--limit", type=int, default=None,
                     help="scrape at most this many models per site this run")
-    ap.add_argument("--max-age", type=float, default=CFG["max_age_days"],
+    ap.add_argument("--max-age", type=float, default=None,
                     help="re-scrape a model if older than this many days")
-    ap.add_argument("--empty-max-age", type=float, default=CFG["empty_max_age_days"],
+    ap.add_argument("--empty-max-age", type=float, default=None,
                     help="re-check models that had no listings after this many days")
     ap.add_argument("--force", action="store_true", help="re-scrape every model")
     ap.add_argument("--models", default=None, help='only these, e.g. "bmw/320,audi/a4"')
@@ -63,14 +68,14 @@ def parse_args():
                     help="only run the damaged-listings sweep")
     ap.add_argument("--no-damage-sweep", action="store_true",
                     help="skip the damage sweep that follows a scrape")
-    ap.add_argument("--block-threshold", type=int, default=CFG["block_threshold"])
+    ap.add_argument("--block-threshold", type=int, default=None)
     ap.add_argument("--backfill-descriptions", action="store_true",
                     help="fetch seller descriptions for listings not checked yet")
     ap.add_argument("--ids-file", default=None,
                     help="with --backfill-descriptions: only these ads, in order "
                          "(lines 'site:id' or 'id'; autoplius_stats.py writes "
                          "data/candidates.txt)")
-    ap.add_argument("--description-delay", type=float, default=CFG["description_delay"])
+    ap.add_argument("--description-delay", type=float, default=None)
     ap.add_argument("--description-limit", type=int, default=None)
     ap.add_argument("--all-descriptions", action="store_true",
                     help="after scraping, fetch every missing description (slow)")
@@ -84,7 +89,7 @@ def parse_args():
                     help="delete listings their model's latest scrape didn't find")
     ap.add_argument("--dry-run", action="store_true", help="with --prune-gone: only report")
     args = ap.parse_args()
-    if args.description_delay < 0:
+    if args.description_delay is not None and args.description_delay < 0:
         ap.error("--description-delay must be zero or greater")
     if args.description_limit is not None and args.description_limit < 1:
         ap.error("--description-limit must be at least 1")
@@ -115,7 +120,18 @@ def sync_catalogue(site, db, session, blocks, args):
     return True
 
 
+def site_args(site, args):
+    """args with every unset per-site value filled from the site's config."""
+    cfg = SETTINGS[site.SOURCE]
+    filled = vars(args).copy()
+    for name in PER_SITE:
+        if filled[name] is None:
+            filled[name] = cfg[CONFIG_KEY.get(name, name)]
+    return SimpleNamespace(**filled)
+
+
 def run_site(site, store, session, args):
+    args = site_args(site, args)
     db = store.site(site.SOURCE)
     blocks = BlockDetector(threshold=args.block_threshold)
 

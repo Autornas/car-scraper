@@ -185,6 +185,19 @@ on the real file: every count identical, backup kept).
 **Done when:** everything from Phases 1–2 works the same on the new schema.
 
 ### Phase 4 — autogidas.lt collector (M–L)
+**Status: done 2026-11-04** (first full pass of the site pending).
+`scripts/collectors/autogidas.py`. Differences from the plan: models aren't
+available without the robots-disallowed `/ajax` / `/select` endpoints, so
+the site is searched per make and each car's model is read from its card
+title and matched against the shared catalogue (60 of 60 sample titles
+matched a known model). Ad pages, damage sweep (7 defect types, minor
+defects left out) and the watcher work as planned; tested live on a copy.
+
+Phase 3 re-check, done at the same time: the ad-page reader crashed on a
+missing import (never exercised by a test or a live run until now; fixed,
+and both sites' ad readers are now tested), and "gone" detection could not
+work for a site searched per make (fixed, tested). A static check
+(pyflakes) is clean.
 1. Card parser and ad-page parser (description, parameter table, VIN where
    shown), tested against fixtures.
 2. Full scrape: walk by make/model (or price bands), the same resumable way.

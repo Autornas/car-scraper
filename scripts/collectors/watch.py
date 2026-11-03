@@ -235,7 +235,7 @@ class WatchStore:
             store.conn.commit()
 
     def model_pairs(self):
-        return self.db.model_pairs()
+        return self.db.canonical_pairs()
 
     def is_known(self, ad_id):
         with self.store.lock:
@@ -311,11 +311,12 @@ def health(conn, source, stale_minutes=15):
         stale = age > stale_minutes
     keys = ("id", "found_at", "make", "model", "title", "year", "km", "price", "lo",
             "mid", "verdict", "flags", "link")
+    deals = [{**dict(zip(keys, d)), "source": source} for d in deals]
     return {
         "last": dict(zip(("started_at", "status", "pages", "new", "reached_known",
                           "hit_cap", "message"), last)) if last else None,
         "last_ok": last_ok, "failures": failures, "stale": stale, "new_24h": new_24h,
-        "deals": [dict(zip(keys, d)) for d in deals],
+        "deals": deals,
     }
 
 

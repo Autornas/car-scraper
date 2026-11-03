@@ -24,7 +24,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-from collectors.common import BlockDetector, clean_number, fetch, name_slug
+from collectors.common import (HEADERS, BlockDetector, clean_number, fetch, name_slug,
+                               parse_age)
 
 SOURCE = "autoplius"
 PAGE_SIZE = 20
@@ -416,22 +417,6 @@ def result_count(html):
     """The '(17)' total the site prints over a result list, or None."""
     m = re.search(r'class="result-count"[^>]*>\s*\(?\s*([\d\s ]+)\)', html or "")
     return clean_number(m.group(1)) if m else None
-
-AGE_UNITS = {"min": 1, "val": 60, "d": 1440, "sav": 10080, "mėn": 43200}
-
-
-def parse_age(text):
-    """Minutes since publishing, from a card's badge: "Prieš 1 val. 15 min." -> 75,
-    "Mažiau nei prieš minutę" -> 0. None for anything else (older ads carry no
-    badge at all)."""
-    text = (text or "").strip().lower()
-    if not text:
-        return None
-    if "mažiau nei" in text:
-        return 0
-    parts = re.findall(r"(\d+)\s*(min|val|d|sav|mėn)\b", text)
-    return sum(int(n) * AGE_UNITS[unit] for n, unit in parts) if parts else None
-
 
 def card_ages(html):
     """{ad id: minutes since published} for every card on a results page that

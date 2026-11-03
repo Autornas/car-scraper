@@ -1,10 +1,15 @@
 """
 collectors/crawl.py — the full scrape, written once for every site.
 
-A site module (collectors.autoplius, later collectors.autogidas) supplies
-URLs and parsers; this walks each model's search page by page, splits searches
-that hit the pagination cap by price, sweeps the site's damaged listings,
-reads ad pages for descriptions, and measures coverage.
+A site module (collectors.autoplius, collectors.autogidas) supplies URLs and
+parsers; this walks each model's search page by page, splits searches that hit
+the pagination cap by price, sweeps the site's damaged listings, reads ad pages
+for descriptions, and measures coverage.
+
+A site with MAKE_SEARCH = True (autogidas) is searched per make instead: its
+"models" are makes with model "*", and each car's model is read from its card
+title, matched against the shared catalogue (ModelResolver), so it lands under
+the same make/model as the same car on any other site.
 
 `site` is the site module, `db` its SiteStore (store.site(site.SOURCE)).
 """
@@ -13,8 +18,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from collectors.common import STOP, diagnose, fetch, probe, title_fits
+from collectors.common import STOP, diagnose, fetch, normalized_label, probe, title_fits
 from collectors.store import find_gone
+from collectors.watch import ModelResolver
 
 
 def scrape_search(site, url, make, model, db, session, blocks, args, label=""):
@@ -31,18 +37,33 @@ def scrape_search(site, url, make, model, db, session, blocks, args, label=""):
     the walk short, so the caller knows not to mark the model as done.
     """
     ids = set()
-    known_models = db.models_for_make(make)
+    make_search = getattr(site, "MAKE_SEARCH", False)
+    if make_search:
+        resolver = ModelResolver(db.canonical_pairs())
+    else:
+        known_models = db.models_for_make(make)
     rejected = 0
+
+    def place(row):
+        """(make, model) to store this card under, or None to reject it."""
+        title = row.get("title", "")
+        if make_search:
+            if not normalized_label(title).startswith(normalized_label(make)):
+                return None                       # another make: a bad search answer
+            row_make, row_model, _ = resolver.resolve(title)
+            return (row_make, row_model) if row_make and row_model else None
+        return (make, model) if title_fits(title, make, model, known_models) else None
 
     def take(html):
         nonlocal rejected
         page_rows = list(site.scrape_page(html))
         rows = []
         for row in page_rows:
-            if not title_fits(row.get("title", ""), make, model, known_models):
+            where = place(row)
+            if where is None:
                 rejected += 1
                 continue
-            row["_make"], row["_model"] = make, model
+            row["_make"], row["_model"] = where
             rows.append(row)
         fresh = [r for r in rows if r["id"] not in ids]
         ids.update(r["id"] for r in rows)

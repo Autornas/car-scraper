@@ -1,7 +1,8 @@
-# Autoplius scraper and price reports
+# Used-car scraper and price reports (autoplius.lt + autogidas.lt)
 
-Small Python command-line tools for collecting public Autoplius car listings
-and generating local price-analysis reports.
+Python tools that collect public used-car listings from autoplius.lt and
+autogidas.lt into one database, catch new ads within minutes, and tell
+bargains apart from damaged or problem cars.
 
 ## Project plan
 
@@ -18,10 +19,11 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   LightGBM price model with p10–p90 ranges; report; local dashboard;
   gap-free 5-minute watcher that prices new ads and checks cheap ones; full
   make/model catalogue with id-based searches; site-wide damage sweep;
-  multi-site database and shared collector code.
-- **In progress:** the first full pass over the whole catalogue (Autoplius
-  rate-limited a faster pass; it now runs at one request every ~2 s).
-- **Not started:** autogidas.lt, multi-user website, hosting, alerts.
+  multi-site database and shared collector code; autogidas.lt collector
+  (full scrape per make, damage sweep, watcher, ad pages).
+- **In progress:** the first full pass over both sites (Autoplius
+  rate-limited a faster pass; both now run at one request every ~2 s).
+- **Not started:** cross-site duplicates, multi-user website, hosting, alerts.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
@@ -33,8 +35,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   explain the 37k vs 46.5k gap, nightly refresh.
 - [x] **3. Multi-site database:** every row keyed by (source, id), make/model
   aliases per site, shared collector code in `scripts/collectors/`.
-- [ ] **4. autogidas.lt collector:** parsers, full scrape, damage sweep
-  (`f_46`), watcher (`f_50=naujausi_desc`).
+- [x] **4. autogidas.lt collector:** parsers, full scrape per make, damage
+  sweep (`f_46`), watcher (`f_50=naujausi_desc`), ad pages.
 - [ ] **5. Combine sites:** detect the same car on both, count it once.
 - [ ] **6. Verdicts:** Deal / Damaged / Problem / Not a real price /
   Unchecked, with admin feedback.
@@ -90,11 +92,33 @@ in `config.toml`). The code behind them lives in `scripts/collectors/`:
 | `crawl.py` | the model-by-model scrape, price-band splitting, damage sweep, ad pages, coverage |
 | `watch.py` | the gap-free page walk, title matching, verdicts, health |
 | `autoplius.py` | everything specific to autoplius.lt: URLs, card and ad parsers, catalogue, damage filter |
+| `autogidas.py` | the same for autogidas.lt |
 
-A new site is one more module like `autoplius.py`, registered in
-`collectors/__init__.py`. Its make/model names are mapped to the shared ones in
-the `model_aliases` table, so the price model treats a car the same whichever
-site it came from.
+A new site is one more module like these, registered in
+`collectors/__init__.py` and switched on in `config.toml`.
+
+**Shared make/model names.** Autoplius' catalogue is the canonical list. Cars
+from other sites are filed under it by matching their card titles against it
+("Mercedes-Benz C 220 T CDI" -> `mercedes-benz/c220`), so the price model
+treats a car the same whichever site it came from. `model_aliases` is there
+for a site's own names that need mapping by hand.
+
+### autogidas.lt
+
+- **Per make, not per model.** Its full model lists come only from `/ajax`
+  and `/select` endpoints, which its robots.txt disallows, so the scraper
+  searches each make (the make list with counts is on every results page,
+  ~90 makes) and reads each car's model from its title. A full pass is
+  ~1,400 pages; big makes split by price as on Autoplius.
+- **Damage sweep:** one search per defect type (`f_46`): damaged, burnt,
+  flooded, hail, engine, gearbox, other major (~750 cars). "Other minor
+  defects" is left out, as Autoplius' filter leaves it out.
+- **Watcher:** the same gap-free walk over its newest-first list.
+- **Card details** match Autoplius' spellings (fuel, gearbox, body), and the
+  body type is taken from the ad URL since cards don't show it.
+
+Settings are in the `[autogidas]` section of `config.toml`;
+`enabled = false` there switches the site off everywhere.
 
 **Database upgrade.** The first run of the new code converts an older
 single-site database automatically and keeps the old file next to it as
