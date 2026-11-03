@@ -42,5 +42,20 @@ nightly_reads = 150      # unchecked ads the nightly job reads per site (0 = non
 pooled = true            # LightGBM price model (false = per-group baselines)
 
 [dashboard]
-port = 8765
 start_watcher = true     # start the watcher when the dashboard starts
+
+[alerts]
+# Telegram messages; off until a bot token is set in data/secrets.toml
+# (see scripts/collectors/alerts.py). Never put the token in this file.
+deals = true             # every new car the watcher rates "deal"
+watcher_failures = true  # a site's watcher failing 3 scans in a row
+
+[web]
+host = "127.0.0.1"       # only this PC; others reach it through Cloudflare Tunnel
+port = 8765
+auth = "local"           # "local": only you on this PC; "cloudflare": signed-in users
+team_domain = ""         # cloudflare: e.g. "yourteam.cloudflareaccess.com"
+audience = ""            # cloudflare: the Access application's AUD tag
+admins = []              # cloudflare: e.g. ["you@gmail.com"]
+viewers = []             # cloudflare: e.g. ["friend@gmail.com"]
+viewer_descriptions = true   # viewers see sellers' descriptions

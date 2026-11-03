@@ -24,7 +24,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
 - **In progress:** the first full pass over both sites. Both sites
   rate-limit long runs, so the nightly job finishes it a few hundred models a
   night.
-- **Not started:** multi-user website, hosting, alerts.
+- **Not started:** putting the site online (Cloudflare Tunnel), backups,
+  monitoring.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
@@ -43,8 +44,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
 - [x] **6. Verdicts:** deal / unchecked / damaged / problem / not a real
   price on every cheap car, your own labels from the report and dashboard,
   agreement and sold-speed per verdict.
-- [ ] **7. Web server:** FastAPI, admin and viewer roles, paginated data,
-  alerts.
+- [x] **7. Web server:** FastAPI site with admin and viewer roles, Cloudflare
+  Access sign-in, watcher alongside tasks, audit log, Telegram alerts.
 - [ ] **8. Go live:** Cloudflare Tunnel + Access, Windows service, backups,
   monitoring.
 
@@ -181,17 +182,58 @@ CAPTCHA after ~350 models. A "too many requests" answer is now waited out
 (30 s, 90 s, 240 s, or the site's own `Retry-After`) before the run gives up,
 and a challenge page is never mistaken for an empty model.
 
-## Scraper control dashboard
+## Website and control dashboard
 
-From the project root in PowerShell, start the dashboard:
+From the project root in PowerShell, start the site:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\scraper_dashboard.py
 ```
 
-It opens `http://127.0.0.1:8765/` and starts the five-minute watcher
-automatically. The dashboard is local to this computer. Keep its terminal
-open; Ctrl+C stops the dashboard and active task. It has three sections:
+It opens `http://127.0.0.1:8765/admin` and starts the five-minute watcher.
+It only ever listens on this PC (127.0.0.1). Keep its terminal open; Ctrl+C
+stops the site, the watcher and any running task.
+
+| Page | Who | What |
+|---|---|---|
+| `/` | everyone signed in | the deals report, viewer copy |
+| `/admin` | admins | the control dashboard (below) |
+| `/report` | everyone | admins get the full report, viewers the viewer copy |
+
+**Sign-in** (`[web]` in `config.toml`):
+
+- `auth = "local"` (default): only you, on this PC, as admin. A request that
+  reaches the site through any other hostname (a tunnel) is refused, so this
+  mode can't be exposed by accident.
+- `auth = "cloudflare"`: for use behind Cloudflare Tunnel + Access. Every
+  request must carry Cloudflare's signed login token; it is verified against
+  your team's keys (`team_domain`), the application's AUD tag (`audience`),
+  the issuer and the expiry. The email in it must be in `admins` or
+  `viewers`; anyone else is refused. Setting up the tunnel is Phase 8.
+
+**Viewers** get a copy of the report with your labels removed (and sellers'
+descriptions too if `viewer_descriptions = false`), served compressed (~2 MB).
+They can't open `/admin` or call any admin API: the server checks the role
+on every request, whatever the page shows.
+
+**Changes** (start/stop, labels, model list) must be JSON sent from the
+site's own pages (Origin = Host), and are written to an audit log shown on
+the Control page. Every answer carries a strict Content-Security-Policy and
+the usual security headers.
+
+**Telegram alerts** (optional): create a bot with @BotFather, then put its
+token and your chat id in `data/secrets.toml` (kept out of git):
+
+```toml
+[telegram]
+bot_token = "123456:ABC..."
+chat_id = "123456789"
+```
+
+The watcher then messages you for every new car it rates **deal** and when a
+site's watcher fails 3 scans in a row (`[alerts]` in `config.toml`).
+
+The control dashboard at `/admin` has three sections:
 
 - **Control**: database numbers (listings, models, damage coverage, kW
   coverage, descriptions read, candidates waiting, new ads in 24 h, report
@@ -213,7 +255,9 @@ open; Ctrl+C stops the dashboard and active task. It has three sections:
 
 The dashboard displays a dismissible pop-up if a scraper reports common access
 or runtime errors, exits unsuccessfully, or if the watcher stops unexpectedly.
-Normal completion of the database scraper is shown as a success notice;
+The watcher runs in its own slot, alongside one task at a time; the output
+panel switches between the task and the watcher. Normal completion of a task
+is shown as a success notice;
 stopping a task from the dashboard is shown separately.
 When a scraper gets HTTP 403 from Autoplius, the dashboard opens that refused
 page in your default browser once per run and shows a link to it. You can

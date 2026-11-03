@@ -265,6 +265,17 @@ candidate:
 and you agree with the verdict on a spot check of 50.
 
 ### Phase 7 — Web server with admin and user roles (L)
+**Status: done 2026-11-04.** `scripts/web/` (FastAPI): `auth.py` verifies
+Cloudflare Access tokens (or local-only mode), `app.py` serves pages and the
+admin API with role checks, CSRF (Origin) checks, security headers and an
+audit log; `admin.py` is the control page and task runner, with the watcher
+in its own slot. Telegram alerts in `collectors/alerts.py`.
+One change from the plan: viewers get a viewer copy of the existing report
+(labels removed; descriptions optional) rather than a new paginated API. It
+is 2.2 MB compressed and filters instantly once loaded; rebuilding the whole
+UI around server-side paging wasn't worth it at this size. Tested: forged,
+expired, wrong-audience and wrong-issuer tokens, strangers, and every admin
+action called directly as a viewer are all refused.
 1. FastAPI app that replaces `scraper_dashboard.py`; the scheduler from §3
    runs inside it.
 2. **Viewer pages (`/`):** deals list (paginated, filters, verdicts), car

@@ -20,3 +20,5 @@ archive/
 .claude/
 data/price_model/
 data/logs/
+data/secrets.toml
+reports/

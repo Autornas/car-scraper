@@ -3,7 +3,7 @@ never deletes, never touches another site's rows."""
 
 import pytest
 
-import scraper_dashboard as dash
+import web.admin as dash
 from collectors import autogidas as ag
 from collectors import autoplius as ap
 from collectors.store import Store

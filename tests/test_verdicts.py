@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import autoplius_stats as st
-import scraper_dashboard as dash
+import web.admin as dash
 from collectors import watch as w
 from collectors.store import Store
 from collectors.verdicts import classify, label_agrees, load_labels, set_label

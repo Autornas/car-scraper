@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from collectors.common import DATA_DIR, BlockDetector, fetch, name_slug, normalized_label
+from collectors import alerts
 from collectors.dupes import same_car_elsewhere
 from collectors.verdicts import IMPLAUSIBLE_SHARE, classify, text_flags
 from collectors.verdicts import SCHEMA as LABELS_SCHEMA
@@ -444,6 +445,9 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
         v, flags = verdict(row["price_eur"], lo, mid, details, row["title"], description, read)
         also = watch.same_car_elsewhere(car)
         watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags, also)
+        if v == "deal":
+            alerts.deal_alert(site.SOURCE, row["title"], row["year"], row["price_eur"],
+                              mid, lo, row["link"], also)
         print(f"  {v.upper():<16} {row['title']} {row['year']} €{row['price_eur']:,} "
               f"(expected €{mid:,.0f}, low end €{lo:,.0f}) {row['link']}"
               + (f"  [also on {also['source']} €{also['price_eur']:,}]" if also else ""),

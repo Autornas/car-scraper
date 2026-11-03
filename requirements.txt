@@ -2,3 +2,6 @@ beautifulsoup4
 requests
 numpy
 lightgbm
+fastapi
+uvicorn
+pyjwt[crypto]

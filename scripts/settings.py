@@ -58,8 +58,21 @@ DEFAULTS = {
         "nightly_reads": 150,
         "pooled": True,
     },
-    "dashboard": {
+    "alerts": {
+        "deals": True,
+        "watcher_failures": True,
+    },
+    "web": {
+        "host": "127.0.0.1",
         "port": 8765,
+        "auth": "local",
+        "team_domain": "",
+        "audience": "",
+        "admins": [],
+        "viewers": [],
+        "viewer_descriptions": True,
+    },
+    "dashboard": {
         "start_watcher": True,
     },
 }

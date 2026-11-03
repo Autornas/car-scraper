@@ -820,6 +820,36 @@ def sold_summary(cars, groups):
     }
 
 
+def page_data(payload):
+    """The report's data as a JS literal. "</" would close the <script> block
+    early and take the rest of the page with it; "<\\/" is the same string to
+    a JS parser. ensure_ascii also neutralises U+2028/U+2029, which are
+    newlines in JS but not in JSON."""
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=True).replace("</", "<\\/")
+
+
+def viewer_payload(payload, descriptions=True):
+    """
+    The copy of the report viewers get (web/app.py serves it). Admin-only data
+    is removed from the data itself, not just hidden in the page: your labels
+    and agreement figures always, sellers' descriptions unless
+    [web] viewer_descriptions.
+    """
+    cols = {k: i for i, k in enumerate(payload["cols"])}
+    blank = [cols["label"]] + ([] if descriptions else [cols["description"]])
+    cars = []
+    for row in payload["cars"]:
+        row = list(row)
+        for i in blank:
+            row[i] = ""
+        if not descriptions:
+            row[cols["description_checked"]] = 0
+        cars.append(row)
+    meta = {**payload["meta"], "viewer": True, "viewer_descriptions": descriptions,
+            "verdicts": [{**r, "labelled": 0, "agreed": 0} for r in payload["meta"]["verdicts"]]}
+    return {**payload, "cars": cars, "meta": meta}
+
+
 def verdict_summary(cars):
     """Per verdict: how many cars, how many you labelled, how many of those you
     agreed with, and how fast they disappeared (median days listed, measured
@@ -1046,7 +1076,7 @@ HTML = r"""<!doctype html>
     under 30% of expected or far outside its group: a lease figure, deposit, typo or parts car.
     Unchecked cars become one of the others once their ad is read: the nightly job reads the
     best ones, and <em>Check top candidates</em> in the dashboard does it on demand.</p>
-    <p><strong>Your verdict.</strong> Open a car and mark it <em>real deal</em>,
+    <p id="labelHelp"><strong>Your verdict.</strong> Open a car and mark it <em>real deal</em>,
     <em>damaged</em> or <em>fake price</em>. Your label overrides the verdict in this list,
     is kept in the database, and the <em>Verdicts</em> tab shows how often the two agree.
     Saving labels works when the report is opened from the dashboard.</p>
@@ -1143,11 +1173,14 @@ const detailRow = (c, cols) => {
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
     d ? `<div class="desc">${esc(d)}</div>`
+      : VIEWER && !DATA.meta.viewer_descriptions ? ""
       : `<div class="muted">${c[C.description_checked] ? "The seller wrote no description."
+        : VIEWER ? "The ad hasn't been read yet."
         : "Description not fetched yet — run “Check top candidates” in the dashboard."}</div>`}
     ${labelButtons(c)}</td></tr>`;
 };
-const labelButtons = c => `<div class="labels" data-key="${esc(c[C.src]+"|"+c[C.aid])}">
+const VIEWER = !!DATA.meta.viewer;
+const labelButtons = c => VIEWER ? "" : `<div class="labels" data-key="${esc(c[C.src]+"|"+c[C.aid])}">
   <span class="muted">Your verdict:</span>${["deal", "damaged", "fake"].map(l =>
     `<button data-label="${l}" class="${c[C.label] === l ? "on" : ""}">${LABEL_NAMES[l]}</button>`
   ).join("")}<button data-label="" ${c[C.label] ? "" : "hidden"}>clear</button>
@@ -1250,9 +1283,10 @@ document.getElementById("tiles").innerHTML=[
    `Under the low end of their range, ad read, nothing found. `
    + `${(VS.unchecked ? VS.unchecked.n : 0).toLocaleString()} more are unchecked; `
    + `${["damaged","problem","not a real price"].map(v => `${VS[v] ? VS[v].n : 0} ${v}`).join(", ")}.`],
-  ["Your checks", LABELLED ? `${Math.round(AGREED / LABELLED * 100)}% agree` : "none yet",
+  ...(DATA.meta.viewer ? [] : [["Your checks",
+   LABELLED ? `${Math.round(AGREED / LABELLED * 100)}% agree` : "none yet",
    LABELLED ? `${LABELLED} cars labelled by you; the verdict agreed on ${AGREED}.`
-            : "Open a car and mark it real deal, damaged or fake price."],
+            : "Open a car and mark it real deal, damaged or fake price."]]),
   ["Price cuts seen",DATA.meta.drops,"listings whose asking price fell since first seen"],
   ["Disappeared",DATA.meta.sold.gone,"listings that stopped appearing while their model was still scraped"],
 ].map(([l,v,t])=>`<div class="tile" title="${esc(t)}"><div class="v">${v}</div>
@@ -1345,6 +1379,10 @@ document.getElementById("fuel").onchange=readFilters;
 document.getElementById("gearSel").onchange=readFilters;
 document.getElementById("siteSel").onchange=readFilters;
 document.getElementById("verdictSel").onchange=()=>drawCars();
+if (DATA.meta.viewer) {
+  document.querySelector('#verdictSel option[value="labelled"]').remove();
+  document.getElementById("labelHelp").remove();
+}
 document.getElementById("reset").onclick=()=>{
   clearTimeout(debounceT);
   document.querySelectorAll("#filters input,#filters select").forEach(e=>e.value="");
@@ -1682,6 +1720,8 @@ def main():
     ap = argparse.ArgumentParser(description="Price baselines from the scraped database")
     ap.add_argument("--db", default=str(project_path(SETTINGS["paths"]["database"])))
     ap.add_argument("-o", "--output", default=str(REPORTS_DIR / "report.html"))
+    ap.add_argument("--public-output", default=None,
+                    help="the viewer copy (default: report_public.html next to --output)")
     ap.add_argument("--generations", default=str(DATA_DIR / "generations.json"))
     ap.add_argument("--bucket", type=int, default=CFG["bucket"], help="year band width within a generation")
     ap.add_argument("--min-n", type=int, default=CFG["min_n"], help="minimum cars per group")
@@ -1811,10 +1851,12 @@ def main():
     # "</" would close the <script> block early and take the rest of the page with
     # it; "<\/" is the same string to a JS parser. ensure_ascii also neutralises
     # U+2028/U+2029, which are newlines in JS but not in JSON.
-    data_js = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).replace("</", "<\\/")
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(HTML.replace("__DATA__", data_js), encoding="utf-8")
+    out.write_text(HTML.replace("__DATA__", page_data(payload)), encoding="utf-8")
+    public = Path(args.public_output) if args.public_output else out.with_name("report_public.html")
+    public.write_text(HTML.replace("__DATA__", page_data(
+        viewer_payload(payload, SETTINGS["web"]["viewer_descriptions"]))), encoding="utf-8")
 
     m = payload["meta"]
     detail = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items(), key=lambda kv: -kv[1]))

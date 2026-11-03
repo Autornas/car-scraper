@@ -14,12 +14,13 @@ import time
 
 import requests
 
-from collectors import enabled_sites, get_site
+from collectors import alerts, enabled_sites, get_site
 from collectors import watch as w
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
 CFG = SETTINGS["watcher"]
+FAILURE_ALERT_AFTER = 3          # failed scans in a row before a Telegram alert
 
 
 def main():
@@ -61,6 +62,7 @@ def main():
               f"known page(s), cap {args.max_pages} pages).")
         print("New ads are priced " + ("with the saved model." if model else
               "- no saved model yet: run autoplius_stats.py once to enable deal checks."))
+        failures = {site.SOURCE: 0 for site in sites}
         while True:
             started = time.monotonic()
             if w.model_mtime() != model_mtime:     # report rebuilt: use the new model
@@ -68,9 +70,16 @@ def main():
                 model_mtime = w.model_mtime()
             for site in sites:
                 try:
-                    w.scan(site, session, store, watches[site.SOURCE], model, compiled, args)
+                    result = w.scan(site, session, store, watches[site.SOURCE], model,
+                                    compiled, args)
+                    failed = result["failed"] and not result["pages"]
                 except requests.RequestException as exc:
                     print(f"  ! {site.SOURCE} scan failed: {exc}", file=sys.stderr)
+                    failed = True
+                # one alert when a site starts failing, not one every 5 minutes
+                failures[site.SOURCE] = failures[site.SOURCE] + 1 if failed else 0
+                if failures[site.SOURCE] == FAILURE_ALERT_AFTER:
+                    alerts.failure_alert(site.SOURCE, failures[site.SOURCE])
             if args.once:
                 break
             wait = args.interval_minutes * 60 - (time.monotonic() - started)
