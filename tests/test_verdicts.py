@@ -25,7 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
     (dict(price=12_000), None),                               # at or above expected
     (dict(price=9_500), None),                                # cheap, but not under the low end
     (dict(price=2_000), "not a real price"),                  # under 30% of expected
-    (dict(price=9_500, outlier=True), "not a real price"),    # outside its group
+    (dict(price=4_500, outlier=True), "not a real price"),    # outside its group, under half
+    # outside its group but close to what the model expects: a real price
+    (dict(price=9_500, outlier=True), None),
+    (dict(price=7_000, outlier=True), "unchecked"),
     (dict(price=7_000, declared=True), "damaged"),
     (dict(price=7_000, flags=["not running"]), "problem"),
     (dict(price=7_000, declared=True, flags=["Daužtas"]), "damaged"),
@@ -104,6 +107,16 @@ def test_new_deals_show_your_label(tmp_path):
 # --------------------------------------------------------------------------- #
 # verdict summary and the whole report build
 # --------------------------------------------------------------------------- #
+def test_stale_listings():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    cars = [{"last_seen": (now - timedelta(days=d)).isoformat(), "gone": g}
+            for d, g in [(1, False), (9, False), (11, False), (30, True)]]
+    st.mark_stale(cars, 10, now)
+    assert [c["stale"] for c in cars] == [False, False, True, False]   # gone isn't "stale"
+    assert cars[2]["seen_date"] == "2026-10-24"
+
+
 def test_verdict_summary_counts_agreement():
     cars = [{"verdict": "deal", "label": "deal", "gone": True, "days": 2.0},
             {"verdict": "deal", "label": "fake", "gone": False, "days": None},
@@ -134,6 +147,9 @@ def test_report_build_end_to_end(tmp_path):
     ag.upsert_many([twin, _listing("autogidas", "g2", "320", 2012, 140_000, 6_400)],
                    "bmw", "320")
     set_label(store.conn, "autoplius", "3", "deal")
+    store.conn.execute("""UPDATE listings SET last_seen = '2026-09-01T00:00:00+00:00'
+                          WHERE source = 'autoplius' AND id = '5'""")      # a month unseen
+    store.conn.commit()
     store.close()
 
     out = tmp_path / "report.html"
@@ -154,5 +170,8 @@ def test_report_build_end_to_end(tmp_path):
     assert [(c[cols["src"]], c[cols["aid"]], c[cols["label"]]) for c in labelled] == \
         [("autoplius", "3", "deal")]
     assert sum(r["labelled"] for r in data["meta"]["verdicts"]) == 1
+    stale = {c[cols["aid"]]: (c[cols["stale"]], c[cols["seen"]]) for c in data["cars"]}
+    assert stale["5"] == (1, "2026-09-01") and stale["6"][0] == 0
+    assert data["meta"]["stale"] == 1
     with sqlite3.connect(db) as con:
         assert con.execute("SELECT COUNT(*) FROM duplicates").fetchone()[0] == 1

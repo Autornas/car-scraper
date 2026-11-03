@@ -97,6 +97,8 @@ def probe(session, url, timeout=20):
 # before asking again, unless the site says how long in Retry-After. A site
 # that is still refusing after the last wait gets left alone for this run.
 BACKOFF_SECONDS = (30, 90, 240)
+# What both sites answer for an ad that has been taken down (sold, withdrawn).
+AD_GONE_STATUS = (404, 410)
 MAX_RETRY_AFTER = 600
 
 

@@ -128,6 +128,40 @@ def test_autogidas_challenge_is_not_an_ad(tmp_path):
     assert not ok and blocks.first_status == 200
 
 
+@pytest.mark.parametrize("site, url", [
+    (ag, "https://autogidas.lt/skelbimas/x-1.html"),
+    (ap, "https://autoplius.lt/skelbimai/x-1.html"),
+])
+def test_a_removed_ad_is_not_a_refusal(tmp_path, site, url):
+    blocks = common.BlockDetector(threshold=1, dump_path=tmp_path / "dump.html")
+    _, _, ok, status = site.fetch_ad_details(OneAnswer(404, "<html>Not found</html>"), url, blocks)
+    assert not ok and status == 404 and not blocks.tripped.is_set()
+
+
+def test_reading_continues_past_a_sold_car(tmp_path):
+    """Regression: one sold car (404) used to stop the whole night's ad reads."""
+    store = Store(tmp_path / "t.db")
+    db = store.site("autogidas")
+    db.upsert_many([{"id": i, "title": "BMW 320", "year": 2015, "price_eur": 9000,
+                     "mileage_km": 1, "fuel": "", "engine_l": "",
+                     "link": f"https://autogidas.lt/skelbimas/x-{i}.html"} for i in ("1", "2")],
+                   "bmw", "320")
+
+    class FakeSite:
+        @staticmethod
+        def fetch_ad_details(session, url, blocks):
+            if url.endswith("-1.html"):
+                return None, {}, False, 404
+            return "Tvarkingas", {"power_kw": 140}, True, 200
+
+    blocks = common.BlockDetector(threshold=1, dump_path=tmp_path / "dump.html")
+    assert crawl.fetch_missing_descriptions(FakeSite, db, None, blocks, 0) == 1
+    rows = dict(store.conn.execute(
+        "SELECT id, removed_at IS NOT NULL FROM listings ORDER BY id").fetchall())
+    assert rows == {"1": 1, "2": 0} and db.descriptions_remaining() == 0
+    store.close()
+
+
 def test_ad_fetchers_refuse_other_hosts():
     with pytest.raises(ValueError):
         ag.fetch_ad_details(OneAnswer(200, ""), "https://example.com/skelbimas/x-1.html")

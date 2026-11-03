@@ -56,6 +56,7 @@ DEFAULTS = {
         "min_n": 5,
         "candidates": 300,
         "nightly_reads": 150,
+        "stale_days": 10,
         "pooled": True,
     },
     "alerts": {

@@ -119,7 +119,7 @@ watcher):
 | **unchecked** | under the low end, ad not read yet |
 | **damaged** | a defect declared on the site |
 | **problem** | problem words in the seller's text (not running, no TA, export, parts, lease transfer) |
-| **not a real price** | under 30% of expected or far outside its group: lease figure, deposit, typo, parts car |
+| **not a real price** | under 30% of expected, or under 50% and far outside its group: lease figure, deposit, typo, parts car |
 
 The Deals tab filters by verdict; the default hides damaged, problem and
 fake prices. Open a car and mark it **real deal**, **damaged** or **fake
@@ -128,6 +128,11 @@ kept in the `labels` table, override the verdict in the list, and the
 **Verdicts & sold speed** tab shows how often you agreed with each verdict and
 how fast each verdict's cars disappear. Saving labels works when the report is
 opened from the dashboard.
+
+**Current cars only.** Sold cars, and cars no scrape has seen for over
+`report.stale_days` (10) days, are hidden from the Deals list unless you tick
+*Include cars not seen recently*, and the nightly job doesn't spend ad reads
+on them. An ad page that answers "not found" marks its car as sold.
 
 By definition about 10% of cars sit under their p10, so "unchecked" is
 large. Its best (furthest under) cars are read first: the nightly job reads

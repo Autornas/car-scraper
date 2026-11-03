@@ -26,7 +26,8 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlunpar
 import requests
 from bs4 import BeautifulSoup
 
-from collectors.common import HEADERS, BlockDetector, clean_number, fetch, name_slug, parse_age
+from collectors.common import (AD_GONE_STATUS, HEADERS, BlockDetector, clean_number,
+                               fetch, name_slug, parse_age)
 
 SOURCE = "autogidas"
 PAGE_SIZE = 20
@@ -295,6 +296,9 @@ def fetch_ad_details(session, url, blocks=None):
         if blocks is not None:
             blocks.record_refusal()
         return None, {}, False, None
+    if response.status_code in AD_GONE_STATUS:
+        # The ad was taken down (sold or withdrawn): an answer, not a refusal.
+        return None, {}, False, response.status_code
     if response.status_code != 200:
         print(f"  ! HTTP {response.status_code} for {url}", file=sys.stderr)
         if blocks is not None:

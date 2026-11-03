@@ -18,7 +18,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from collectors.common import STOP, diagnose, fetch, normalized_label, probe, title_fits
+from collectors.common import (AD_GONE_STATUS, STOP, diagnose, fetch, normalized_label,
+                               probe, title_fits)
 from collectors.store import find_gone
 from collectors.watch import ModelResolver
 
@@ -197,7 +198,7 @@ def fetch_missing_descriptions(site, db, session, blocks, delay, limit=None, ids
     progress per ad. With `ids`, only those — e.g. data/candidates.txt."""
     todo = db.missing_descriptions(limit, ids)
     print(f"{len(todo)} listing description(s) queued.")
-    checked = 0
+    checked = removed = 0
     for index, (ad_id, link) in enumerate(todo, start=1):
         if STOP.is_set() or blocks.tripped.is_set():
             break
@@ -212,6 +213,11 @@ def fetch_missing_descriptions(site, db, session, blocks, delay, limit=None, ids
         except ValueError as exc:
             print(f"[{index}/{len(todo)}] {ad_id}: {exc}", file=sys.stderr)
             db.save_description(ad_id, None)
+            continue
+        if status in AD_GONE_STATUS:
+            db.mark_removed(ad_id)
+            print(f"[{index}/{len(todo)}] {ad_id}: ad taken down (sold or withdrawn)")
+            removed += 1
             continue
         if not completed:
             if status == 200:
@@ -228,7 +234,8 @@ def fetch_missing_descriptions(site, db, session, blocks, delay, limit=None, ids
         print(f"[{index}/{len(todo)}] {ad_id}: {result}")
         if index < len(todo) and delay:
             time.sleep(delay)
-    print(f"Descriptions checked this run: {checked}")
+    print(f"Descriptions checked this run: {checked}"
+          + (f" ({removed} ads already taken down)" if removed else ""))
     print(f"Descriptions still queued: {db.descriptions_remaining()}")
     return checked
 

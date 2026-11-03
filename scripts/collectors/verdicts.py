@@ -3,9 +3,9 @@ collectors/verdicts.py — what a cheap car really is, and what you said it is.
 
 Every car priced under what the model expects for it gets one verdict:
 
-    not a real price   under 30% of expected, or so far below its group that
-                       the group's own percentiles exclude it: a lease
-                       payment, a deposit, a typo, a parts car
+    not a real price   under 30% of expected, or under 50% and so far below
+                       its group that the group's own percentiles exclude it:
+                       a lease payment, a deposit, a typo, a parts car
     damaged            a defect declared on the site (its damage filter or the
                        ad's "Defektai" row)
     problem            problem words in the seller's own text: not running,
@@ -36,6 +36,9 @@ AGREES = {"deal": {"deal"}, "damaged": {"damaged", "problem"},
 
 # Under this share of the expected price a listing is not a real asking price.
 IMPLAUSIBLE_SHARE = 0.3
+# A car its group's percentiles exclude is "not a real price" only under this
+# share of expected (see classify).
+OUTLIER_CONFIRM_SHARE = 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +85,11 @@ def classify(price, lo, mid, declared=False, flags=(), read=False, outlier=False
     """
     if not price or not mid or price >= mid:
         return None
-    if price < IMPLAUSIBLE_SHARE * mid or outlier:
+    # A group outlier alone isn't proof: groups (generation + year band) mix
+    # trims and engines, so a fair price can sit outside its group's spread (a
+    # 2025 Skoda Scala at 92% of expected was flagged that way). It only counts
+    # when the price is also far below what the model expects for this car.
+    if price < IMPLAUSIBLE_SHARE * mid or (outlier and price < OUTLIER_CONFIRM_SHARE * mid):
         return "not a real price"
     if declared:
         return "damaged"

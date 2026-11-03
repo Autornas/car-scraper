@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS listings (
     damaged      INTEGER,     -- 1 = in the site's damaged-only search, 0 = not, NULL = unknown
     damage_type  TEXT,        -- the ad page's own "Defektai" value
     reg_country  TEXT,        -- "Pirmosios registracijos šalis"
+    removed_at   TEXT,        -- its ad page answered "not found": taken down
     PRIMARY KEY (source, id)
 );
 CREATE INDEX IF NOT EXISTS idx_make_model ON listings(make, model);
@@ -187,6 +188,8 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         if "listings" in _tables(self.conn) and "source" not in _columns(self.conn, "listings"):
             migrate_v1_to_v2(self.conn, path)
+        if "listings" in _tables(self.conn) and "removed_at" not in _columns(self.conn, "listings"):
+            self.conn.execute("ALTER TABLE listings ADD COLUMN removed_at TEXT")
         self.conn.executescript(SCHEMA)
         self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
                           (str(SCHEMA_VERSION),))
@@ -359,6 +362,16 @@ class SiteStore:
                 (description, now_iso(), details.get("power_kw"),
                  details.get("gearbox"), details.get("body"), damage, damage,
                  details.get("reg_country"), self.source, ad_id))
+            self.conn.commit()
+
+    def mark_removed(self, ad_id):
+        """Its ad page answered "not found": the car was taken down. It also
+        counts as read, so the nightly reads don't try it again."""
+        with self.lock:
+            self.conn.execute(
+                """UPDATE listings SET removed_at = ?, description_checked_at = ?
+                   WHERE source = ? AND id = ?""",
+                (now_iso(), now_iso(), self.source, ad_id))
             self.conn.commit()
 
     def apply_damage_sweep(self, damaged_ids):

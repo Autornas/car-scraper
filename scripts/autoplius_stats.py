@@ -570,7 +570,8 @@ def load(db_path, compiled, min_price, max_price):
     # Columns added by later versions of the scraper read as NULL on an
     # older database, so the report still builds before it is re-scraped.
     optional = ("description", "description_checked_at", "power_kw", "gearbox",
-                "body", "location", "dealer", "damaged", "damage_type", "reg_country")
+                "body", "location", "dealer", "damaged", "damage_type", "reg_country",
+                "removed_at")
     extra_columns = ", ".join(
         name if name in listing_columns else f"NULL AS {name}" for name in optional)
     rows = con.execute(f"""SELECT source, id, make, model, title, year, price_eur, mileage_km,
@@ -708,13 +709,34 @@ def mark_disappeared(cars, scraped):
         # sites searched per make (autogidas) record one "*" model per make
         ref = scraped.get((c["source"], c["make"], c["model"])) \
             or scraped.get((c["source"], c["make"], "*"))
-        c["gone"] = bool(seen and ref and (ref - seen).total_seconds() > 3600)
+        # gone: its model's full scrape no longer finds it, or its ad page
+        # answered "not found" when we went to read it
+        c["gone"] = bool(c.get("removed_at")) \
+            or bool(seen and ref and (ref - seen).total_seconds() > 3600)
         # A listing seen in only ONE scrape carries no duration information:
         # first_seen == last_seen, so the difference is 0 however long it was
         # really up. Reporting that as "0 days listed" would turn ignorance into
         # a measurement, so it stays None and is excluded from the medians.
         c["days"] = round((seen - first).total_seconds() / 86400, 1) \
             if (seen and first and (c["seen_count"] or 0) >= 2) else None
+    return cars
+
+
+def mark_stale(cars, days, now=None):
+    """
+    A listing not seen by any scrape or watcher scan for more than `days` is
+    STALE: maybe sold, maybe just not re-checked yet; its status is unknown.
+    The nightly refresh re-scrapes every model about once a week, so a car
+    that is still listed is normally seen at least that often. Gone listings
+    (sold for certain) aren't counted as stale. Sets c["stale"] and
+    c["seen_date"] (YYYY-MM-DD of the last sighting).
+    """
+    now = now or datetime.now(timezone.utc)
+    for c in cars:
+        seen = parse_ts(c["last_seen"])
+        c["seen_date"] = seen.date().isoformat() if seen else ""
+        c["stale"] = bool(seen and not c["gone"]
+                          and (now - seen).total_seconds() > days * 86400)
     return cars
 
 
@@ -1060,6 +1082,8 @@ HTML = r"""<!doctype html>
       <option value="labelled" data-name="Labelled by you">Labelled by you</option>
       <option value="all" data-name="Everything under expected">Everything under expected</option>
     </select>
+    <label class="toggle"><input type="checkbox" id="showOld">Include cars not seen
+      recently&nbsp;<span id="oldCount" class="muted"></span></label>
     <span class="spacer"></span>
     <span class="count" id="carsCount"></span>
   </div>
@@ -1068,6 +1092,9 @@ HTML = r"""<!doctype html>
     <p><strong>vs low end</strong> is how far the price sits under the bottom of that range:
     positive means cheaper than 9 in 10 comparable cars. Click a row for the seller's
     description and every detail.</p>
+    <p><strong>Current cars only.</strong> Sold cars (<span class="pill gone">gone</span>) and
+    cars no scrape has seen for over <span id="staleDays"></span> days (they may be sold)
+    are hidden; tick <em>Include cars not seen recently</em> to see them.</p>
     <p><strong>Verdicts.</strong> <span class="pill good-pill">deal</span> under the low end,
     ad read, nothing found · <span class="pill">unchecked</span> under the low end, ad not read
     yet · <span class="pill flag">damaged</span> a defect declared on the site ·
@@ -1180,6 +1207,7 @@ const detailRow = (c, cols) => {
     ${labelButtons(c)}</td></tr>`;
 };
 const VIEWER = !!DATA.meta.viewer;
+document.getElementById("staleDays").textContent = DATA.meta.stale_days;
 const labelButtons = c => VIEWER ? "" : `<div class="labels" data-key="${esc(c[C.src]+"|"+c[C.aid])}">
   <span class="muted">Your verdict:</span>${["deal", "damaged", "fake"].map(l =>
     `<button data-label="${l}" class="${c[C.label] === l ? "on" : ""}">${LABEL_NAMES[l]}</button>`
@@ -1224,7 +1252,9 @@ function wireExpand(id){
 const gkey = c => c[C.make]+"|"+c[C.model]+"|"+c[C.grp];
 const GMAP = {}; DATA.groups.forEach(g => GMAP[g.make+"|"+g.model+"|"+g.grp] = g);
 const genPill = g => g && g.is_gen ? `${esc(g.gen)}<span class="pill gen">gen</span>` : "—";
-const gonePill = c => c[C.gone] ? '<span class="pill gone">gone</span>' : "";
+const gonePill = c => c[C.gone] ? '<span class="pill gone">gone</span>'
+  : c[C.stale] ? `<span class="pill gone" title="not seen by any scrape for over ${
+      DATA.meta.stale_days} days: it may be sold">last seen ${esc(c[C.seen])}</span>` : "";
 const oddPill = c => c[C.odd] ? '<span class="pill odd" title="price excluded from this'
   + ' group\'s percentiles as an outlier — usually a parts car, a typo, or a lease figure'
   + ' parsed as a price">outlier</span>' : "";
@@ -1379,6 +1409,7 @@ document.getElementById("fuel").onchange=readFilters;
 document.getElementById("gearSel").onchange=readFilters;
 document.getElementById("siteSel").onchange=readFilters;
 document.getElementById("verdictSel").onchange=()=>drawCars();
+document.getElementById("showOld").onchange=()=>drawCars();
 if (DATA.meta.viewer) {
   document.querySelector('#verdictSel option[value="labelled"]').remove();
   document.getElementById("labelHelp").remove();
@@ -1529,12 +1560,15 @@ const BAD = new Set(["damaged", "problem", "not a real price"]);
 function drawCars(){
   const sel = document.getElementById("verdictSel"), want = sel.value;
   const rows = [], counts = {all: 0, labelled: 0}; let shownByDefault = 0;
+  const showOld = document.getElementById("showOld").checked; let old = 0;
   for(const c of DATA.cars){
     if(!match(c))continue;
     const g=GMAP[gkey(c)];
     if(!g && c[C.exp]==null)continue;
     const r=carRow(c,g);
     if(!(r.vs>0))continue;
+    /* sold (gone) or not seen for a while (stale): hidden unless asked for */
+    if ((c[C.gone] || c[C.stale]) && !showOld) { old++; continue; }
     const v = effVerdict(c);
     counts.all++; counts[v] = (counts[v] || 0) + 1;
     if (!BAD.has(v)) shownByDefault++;
@@ -1544,6 +1578,7 @@ function drawCars(){
     if (keep) rows.push(r);
   }
   /* counts on the dropdown itself, for the current filters */
+  document.getElementById("oldCount").textContent = showOld ? "" : `(${old.toLocaleString()} hidden)`;
   [...sel.options].forEach(o => o.textContent =
     `${o.dataset.name} (${(o.value === "" ? shownByDefault : counts[o.value] || 0).toLocaleString()})`);
   paint("cars",rows,r=>`<tr class="click">
@@ -1747,6 +1782,7 @@ def main():
         sys.exit("No usable listings — scrape some data first.")
     cars = assign_groups(cars, bucket, min_n)
     cars = mark_disappeared(cars, model_scrape_times(args.db))
+    cars = mark_stale(cars, CFG["stale_days"])
     cars, duplicates = merge_duplicates(cars, args.db)
     groups = build_groups(cars, min_n)
     series = model_series(cars, max(3, min_n))
@@ -1765,7 +1801,7 @@ def main():
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
             "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also",
-            "aid", "verdict", "label"]
+            "aid", "verdict", "label", "stale", "seen"]
     con = sqlite3.connect(args.db)
     try:
         labels = load_labels(con)
@@ -1801,7 +1837,8 @@ def main():
             "|".join(c["flags"]), c.get("location") or "", c.get("dealer"), c["source"],
             # the same car elsewhere: "site|price|link", several joined by "~"
             "~".join(f"{o['source']}|{o['price_eur']}|{o['link']}" for o in c.get("also", [])),
-            c["id"], c["verdict"] or "", c["label"] or ""])
+            c["id"], c["verdict"] or "", c["label"] or "",
+            1 if c["stale"] else 0, c["seen_date"]])
 
     # The "unchecked" cars, best first: what the targeted description fetch
     # (scrape.py --ids-file) should spend its requests on. Reading their ads
@@ -1809,7 +1846,10 @@ def main():
     def under(c):
         base = c["lo"] or c["exp"]
         return (base - c["price_eur"]) / base if base else None
-    unread = [c for c in cars if c["verdict"] == "unchecked"]
+    # Stale and gone cars are left out: an ad read is wasted on a car that
+    # may already be sold.
+    unread = [c for c in cars if c["verdict"] == "unchecked"
+              and not c["stale"] and not c["gone"]]
     unread.sort(key=under, reverse=True)
     cand_path = Path(args.candidates_file)
     cand_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1842,6 +1882,7 @@ def main():
             "bad_mileage": bad_mileage,
             "pooled": pooled,
             "suspect": sum(1 for c in cars if c["suspect"]),
+            "stale": sum(1 for c in cars if c["stale"]), "stale_days": CFG["stale_days"],
             "verdicts": verdict_summary(cars),
             "declared": sum(1 for c in cars if c["suspect_declared"]),
             "damage_checked": sum(1 for c in cars if c.get("damaged") is not None),

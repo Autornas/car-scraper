@@ -39,6 +39,7 @@ bucket = 3               # year-band width inside a generation
 min_n = 5                # smallest group shown
 candidates = 300         # unread candidates listed for description checks
 nightly_reads = 150      # unchecked ads the nightly job reads per site (0 = none)
+stale_days = 10          # not seen for longer = may be sold: hidden from deals, not read
 pooled = true            # LightGBM price model (false = per-group baselines)
 
 [dashboard]
