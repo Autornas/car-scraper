@@ -1,0 +1,34 @@
+# Project settings. Every script reads its defaults from here; a command-line
+# flag still overrides a value for that one run. Paths are relative to the
+# project folder. Delete a line to fall back to the built-in default.
+
+[paths]
+data_dir = "data"
+reports_dir = "reports"
+database = "data/autoplius.db"
+
+[autoplius]
+enabled = true
+delay = 1.0              # seconds between page batches
+concurrency = 3          # pages fetched in parallel per batch
+max_age_days = 30        # re-scrape a model once it is older than this
+description_delay = 2.0  # seconds between ad-page requests
+block_threshold = 8      # consecutive refusals before a run stops
+
+[autogidas]
+enabled = false          # collector arrives in phase 4
+
+[watcher]
+interval_minutes = 5
+pages = 3
+delay = 1.0
+
+[report]
+bucket = 3               # year-band width inside a generation
+min_n = 5                # smallest group shown
+candidates = 300         # unread candidates listed for description checks
+pooled = true            # LightGBM price model (false = per-group baselines)
+
+[dashboard]
+port = 8765
+start_watcher = true     # start the watcher when the dashboard starts
