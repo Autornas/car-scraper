@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from autoplius_db import Store
-from watch_new_listings import health as watcher_health
+from collectors.store import Store
+from collectors.watch import health as watcher_health
 
 from settings import SETTINGS, project_path
 
@@ -40,13 +40,13 @@ def _script(name, *args):
 # Commands run one after another; a failed or stopped step ends the task.
 TASKS = {
     "start_watcher": ("watcher", [
-        _script("watch_new_listings.py")]),
-    "start_database": ("database scraper", [_script("autoplius_db.py")]),
-    "rescrape_all": ("full re-scrape", [_script("autoplius_db.py", "--force")]),
-    "refresh_damage": ("damage check", [_script("autoplius_db.py", "--damage-sweep")]),
+        _script("watch.py")]),
+    "start_database": ("database scraper", [_script("scrape.py")]),
+    "rescrape_all": ("full re-scrape", [_script("scrape.py", "--force")]),
+    "refresh_damage": ("damage check", [_script("scrape.py", "--damage-sweep")]),
     "check_candidates": ("candidate check", [
         _script("autoplius_stats.py"),
-        _script("autoplius_db.py", "--backfill-descriptions",
+        _script("scrape.py", "--backfill-descriptions",
                 "--ids-file", str(CANDIDATES_PATH)),
         _script("autoplius_stats.py"),
     ]),
@@ -224,8 +224,8 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
     <div class="d">Every make and model on Autoplius not scraped in the last 7 days, then the damage sweep.</div></div>
     <button data-action="start_database">Start</button></div>
    <div class="task" data-task="full re-scrape"><div class="t"><div class="n">Full re-scrape</div>
-    <div class="d">Every model again, regardless of age — refreshes every price and car detail. About 3 hours.</div></div>
-    <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 3 hours.">Start</button></div>
+    <div class="d">Every model again, regardless of age — refreshes every price and car detail. About 4 hours at a polite pace.</div></div>
+    <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 4 hours.">Start</button></div>
    <div class="group-label">Clean up</div>
    <div class="task" data-task="damage check"><div class="t"><div class="n">Flag damaged cars</div>
     <div class="d">Autoplius' defect filter across the whole site (~2,300 cars, ~120 pages). ~5 min.</div></div>
@@ -490,7 +490,7 @@ def save_database_models(text):
     try:
         with store.lock:
             known = {(mk, md) for mk, md in store.conn.execute(
-                "SELECT make, model FROM models")}
+                "SELECT make, model FROM models WHERE source = 'autoplius'")}
             unknown = [f"{mk}/{md}" for mk, md in wanted if (mk, md) not in known]
             if unknown:
                 raise ValueError(
@@ -498,10 +498,12 @@ def save_database_models(text):
                     + (f" and {len(unknown) - 10} more" if len(unknown) > 10 else "")
                     + ". Run 'Resume scraping' once to sync the catalogue.")
             before = dict(((mk, md), en) for mk, md, en in store.conn.execute(
-                "SELECT make, model, MAX(enabled) FROM models GROUP BY make, model"))
-            store.conn.execute("UPDATE models SET enabled = 0")
+                """SELECT make, model, MAX(enabled) FROM models
+                   WHERE source = 'autoplius' GROUP BY make, model"""))
+            store.conn.execute("UPDATE models SET enabled = 0 WHERE source = 'autoplius'")
             store.conn.executemany(
-                "UPDATE models SET enabled = 1 WHERE make = ? AND model = ?", wanted)
+                """UPDATE models SET enabled = 1
+                   WHERE source = 'autoplius' AND make = ? AND model = ?""", wanted)
             store.conn.commit()
     finally:
         store.close()
@@ -720,7 +722,7 @@ def database_summary():
                     """SELECT COUNT(*), COUNT(last_scraped), MAX(last_scraped) FROM models"""
                 ).fetchone()
         if "watch_scans" in tables:
-            result["watcher"] = watcher_health(connection)
+            result["watcher"] = watcher_health(connection, "autoplius")
     finally:
         connection.close()
     return result
@@ -766,7 +768,8 @@ def make_handler(manager):
                 connection = sqlite3.connect(DB_PATH, timeout=5)
                 try:
                     rows = connection.execute(
-                        """SELECT DISTINCT make, model FROM models WHERE enabled = 1
+                        """SELECT DISTINCT make, model FROM models
+                           WHERE source = 'autoplius' AND enabled = 1
                            ORDER BY make, model"""
                     ).fetchall()
                 except sqlite3.Error as exc:

@@ -26,10 +26,11 @@ DEFAULTS = {
     },
     "autoplius": {
         "enabled": True,
-        "delay": 1.0,
-        "concurrency": 3,
+        "delay": 2.0,
+        "concurrency": 1,
         "max_age_days": 7.0,
         "empty_max_age_days": 30.0,
+        "nightly_limit": 500,
         "description_delay": 2.0,
         "block_threshold": 8,
     },

@@ -146,6 +146,17 @@ evening, **M** = a day or two, **L** = several days.
 captured. Check it with a one-off walk back through that day.
 
 ### Phase 2 — Complete, fresh Autoplius data (S, mostly waiting)
+**Status: code done; first full pass running.** Findings on the way:
+- The model list came from an old sitemap whose name-based URLs no longer
+  work for hyphenated names (`mercedes-benz`, `land-rover`, `ct-200h`): the
+  site returned all 46,676 cars, the title check rejected them, and Mercedes
+  ended up with 66 of 3,749 cars. Searches now go by `make_id` / `model_id`
+  from the site's full catalogue (~3,200 models; it was 1,057 of 26 makes).
+- Starting coverage, measured with `scrape.py --coverage`: 81.1%.
+- A faster pass (3 parallel requests, 1 s apart) got HTTP 429 and a CAPTCHA
+  after ~350 models. Now: 1 request every ~2 s, rate limits waited out, a
+  nightly limit of 500 models so the weekly refresh is spread out.
+- Damage sweep: 2,343 damaged cars on the site, read in ~120 pages.
 1. Switch the damage sweep to the **site-wide** damaged search: about 1,500
    cars ≈ 75 pages, instead of 1,057 searches.
 2. Run a full re-scrape to fill kW / gearbox / body. Rebuild the report and
@@ -159,6 +170,12 @@ captured. Check it with a one-off walk back through that day.
 for most cars.
 
 ### Phase 3 — Multi-site database (M)
+**Status: done 2026-11-03.** Listings, price history and models carry a
+`source`; listings are keyed by (source, id). `model_aliases` maps a site's
+make/model names to the canonical ones. The code is in `scripts/collectors/`
+(common, store, crawl, watch + one module per site), driven by `scrape.py`
+and `watch.py`. Older databases upgrade themselves on first open (verified
+on the real file: every count identical, backup kept).
 1. New schema: `listings(source, source_id, …)`, `price_history(source,
    source_id, …)`, `makes_models` catalogue with per-site aliases.
 2. One-off migration of the current Autoplius data (`source = 'autoplius'`).

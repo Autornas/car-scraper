@@ -16,11 +16,12 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   gearbox, body, town, dealer); damage detection (site filter, ad page,
   problem words); description reading for top candidates only; pooled
   LightGBM price model with p10–p90 ranges; report; local dashboard;
-  gap-free 5-minute watcher that prices new ads and checks cheap ones.
-- **Built, not yet run on the data:** full re-scrape for kW / gearbox / body,
-  damage sweep, candidate description check.
-- **Not started:** autogidas.lt, multi-site database, multi-user website,
-  hosting, alerts.
+  gap-free 5-minute watcher that prices new ads and checks cheap ones; full
+  make/model catalogue with id-based searches; site-wide damage sweep;
+  multi-site database and shared collector code.
+- **In progress:** the first full pass over the whole catalogue (Autoplius
+  rate-limited a faster pass; it now runs at one request every ~2 s).
+- **Not started:** autogidas.lt, multi-user website, hosting, alerts.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
@@ -30,8 +31,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   tracking.
 - [ ] **2. Complete Autoplius data:** site-wide damage sweep, full re-scrape,
   explain the 37k vs 46.5k gap, nightly refresh.
-- [ ] **3. Multi-site database:** `source` + `source_id`, shared make/model
-  catalogue, shared collector code.
+- [x] **3. Multi-site database:** every row keyed by (source, id), make/model
+  aliases per site, shared collector code in `scripts/collectors/`.
 - [ ] **4. autogidas.lt collector:** parsers, full scrape, damage sweep
   (`f_46`), watcher (`f_50=naujausi_desc`).
 - [ ] **5. Combine sites:** detect the same car on both, count it once.
@@ -70,24 +71,40 @@ python -m pip install -r requirements.txt
 
 ## Tools
 
-- `scripts/autoplius_scraper.py` writes listing data to
-  `data/autoplius_cars.csv`.
-- `scripts/watch_new_listings.py` catches every new ad within minutes and
-  writes it straight into `data/autoplius.db` (see "New-listing watcher").
-- `scripts/scraper_dashboard.py` provides a local web interface to start and
-  stop the watcher and resumable database scraper, and view price breakdowns.
-- `scripts/autoplius_db.py` stores resumable listings in `data/autoplius.db` and
-checks listing titles against the selected make/model before saving, to avoid
-classifying unrelated results under a model when the site returns a broad
-search page.
-- `scripts/autoplius_stats.py` reads that database and writes
-  `reports/report.html`.
+- `scripts/scrape.py` builds and refreshes the database, site by site:
+  catalogue sync, model-by-model scrape, damage sweep, ad pages, coverage.
+- `scripts/watch.py` catches every new ad within minutes and writes it
+  straight into the database (see "New-listing watcher").
+- `scripts/autoplius_stats.py` reads the database and writes
+  `reports/report.html` and the saved price model.
+- `scripts/scraper_dashboard.py` is the local web interface for all of it.
+- `scripts/nightly.py` is the unattended nightly refresh.
 
-Run a small scrape with:
+Both scrapers run per site (`--site autoplius`; by default every site enabled
+in `config.toml`). The code behind them lives in `scripts/collectors/`:
 
-```powershell
-python scripts/autoplius_scraper.py --pages 3
-```
+| Module | What it holds |
+|---|---|
+| `common.py` | polite fetching (waits out rate limits), refusal detection, name helpers |
+| `store.py` | the database: listings, price history and models keyed by (source, id); per-site make/model aliases; the automatic upgrade of older files |
+| `crawl.py` | the model-by-model scrape, price-band splitting, damage sweep, ad pages, coverage |
+| `watch.py` | the gap-free page walk, title matching, verdicts, health |
+| `autoplius.py` | everything specific to autoplius.lt: URLs, card and ad parsers, catalogue, damage filter |
+
+A new site is one more module like `autoplius.py`, registered in
+`collectors/__init__.py`. Its make/model names are mapped to the shared ones in
+the `model_aliases` table, so the price model treats a car the same whichever
+site it came from.
+
+**Database upgrade.** The first run of the new code converts an older
+single-site database automatically and keeps the old file next to it as
+`autoplius.db.pre-v2-<date>`.
+
+**Pace.** One request at a time, 2 s apart (`[autoplius]` in `config.toml`).
+A faster pass (three parallel requests, 1 s apart) got HTTP 429 and then a
+CAPTCHA after ~350 models. A "too many requests" answer is now waited out
+(30 s, 90 s, 240 s, or the site's own `Retry-After`) before the run gives up,
+and a challenge page is never mistaken for an empty model.
 
 ## Scraper control dashboard
 
@@ -151,19 +168,21 @@ on ~120 pages, and marks them `damaged = 1`, every other listing `0`. To run
 only the sweep:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\autoplius_db.py --damage-sweep
+.\.venv\Scripts\python.exe scripts\scrape.py --damage-sweep
 ```
 
 **Coverage.** `--coverage` compares the site's live per-make counts with the
 database and lists the biggest gaps:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\autoplius_db.py --coverage
+.\.venv\Scripts\python.exe scripts\scrape.py --coverage
 ```
 
-**Nightly refresh.** `scripts/nightly.py` re-scrapes whatever is due, runs the
-damage sweep and rebuilds the report and price model (a running watcher picks
-the new model up). To have Windows run it every night at 03:30:
+**Nightly refresh.** `scripts/nightly.py` re-scrapes up to
+`autoplius.nightly_limit` (500) of the stalest due models, runs the damage
+sweep and rebuilds the report and price model (a running watcher picks the new
+model up). 500 models a night covers the whole catalogue about once a week
+without one long burst of requests. To have Windows run it every night at 03:30:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_nightly_task.ps1
@@ -179,7 +198,7 @@ best-looking candidates instead:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\autoplius_stats.py
-.\.venv\Scripts\python.exe scripts\autoplius_db.py --backfill-descriptions --ids-file data\candidates.txt
+.\.venv\Scripts\python.exe scripts\scrape.py --backfill-descriptions --ids-file data\candidates.txt
 .\.venv\Scripts\python.exe scripts\autoplius_stats.py --open
 ```
 
@@ -208,17 +227,17 @@ lists live in `FLAG_PATTERNS` in `scripts/autoplius_stats.py` and are
 re-applied on every run.
 
 Older databases are migrated automatically. kW, gearbox and body stay empty
-until a model is scraped again (`autoplius_db.py --force`), and the pooled
+until a model is scraped again (`scrape.py --force`), and the pooled
 model gets sharper once they are filled.
 
 To fetch every missing description (slow), run
-`autoplius_db.py --backfill-descriptions` without `--ids-file`. It fetches one ad at a time with a delay, saves progress as it goes, and stops
+`scrape.py --backfill-descriptions` without `--ids-file`. It fetches one ad at a time with a delay, saves progress as it goes, and stops
 if Autoplius refuses a request or presents a browser challenge. No CAPTCHA or
 other access check is bypassed.
 
 ## New-listing watcher
 
-`scripts/watch_new_listings.py` reads Autoplius' newest-first list
+`scripts/watch.py` reads Autoplius' newest-first list
 ("Naujausi viršuje") every 5 minutes. Each scan keeps reading pages until a
 whole page holds only ads already in the database, then one more page as a
 margin. A quiet period costs two requests, a busy one reads further, and
@@ -236,9 +255,9 @@ price) in the dashboard's **New deals** list. Every scan is recorded, and the
 dashboard shows when scans start failing.
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\watch_new_listings.py            # every 5 minutes
-.\.venv\Scripts\python.exe scripts\watch_new_listings.py --once     # one scan
-.\.venv\Scripts\python.exe scripts\watch_new_listings.py --verify 6 # last 6 h all stored?
+.\.venv\Scripts\python.exe scripts\watch.py            # every 5 minutes
+.\.venv\Scripts\python.exe scripts\watch.py --once     # one scan
+.\.venv\Scripts\python.exe scripts\watch.py --verify 6 # last 6 h all stored?
 ```
 
 `--verify HOURS` walks back through the newest-first list and lists any ad
@@ -249,13 +268,13 @@ the watcher, add `--no-watcher`.
 Build the database and report with:
 
 ```powershell
-python scripts/autoplius_db.py          # everything due (first run: all ~3,200 models)
+python scripts/scrape.py               # everything due (first run: all ~3,200 models)
 python scripts/autoplius_stats.py --open
 ```
 
 Use `--help` on any tool for its options. Output paths can be changed with the
 tools' path arguments. `data/generations.json` holds editable model-generation
-boundaries. `autoplius_db.py --models-file data/models.txt` scrapes only the
+boundaries. `scrape.py --models-file data/models.txt` scrapes only the
 `make/model` pairs listed in that file.
 
 Scrapes only pages publicly available to the request. Keep request delays

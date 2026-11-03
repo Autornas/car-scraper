@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import autoplius_db as db
-import watch_new_listings as w
+from collectors import autoplius as db
+from collectors import watch as w
 
 
 # --------------------------------------------------------------------------- #
@@ -81,7 +81,7 @@ def run_walk(pages, known, margin=1, cap=50):
     def get_page(n):
         calls.append(n)
         return results_page(pages[n - 1]) if n <= len(pages) else ""
-    return w.walk(get_page, lambda i: i in known, margin, cap), calls
+    return w.walk(db, get_page, lambda i: i in known, margin, cap), calls
 
 
 def test_walk_stops_after_a_known_page_plus_margin():
@@ -145,7 +145,7 @@ def test_verdicts():
 def test_health_reports_failures_and_staleness():
     con = sqlite3.connect(":memory:")
     con.executescript(w.SCHEMA)
-    assert w.health(con)["last"] is None
+    assert w.health(con, "autoplius")["last"] is None
     now = datetime.now(timezone.utc)
     rows = [(now - timedelta(minutes=40), "ok", 2), (now - timedelta(minutes=10), "failed", 0),
             (now - timedelta(minutes=5), "failed", 0)]
@@ -153,9 +153,9 @@ def test_health_reports_failures_and_staleness():
         con.execute("""INSERT INTO watch_scans (source, started_at, status, pages, new,
                        reached_known, hit_cap) VALUES ('autoplius', ?, ?, ?, 3, 1, 0)""",
                     (started.isoformat(timespec="seconds"), status, pages))
-    h = w.health(con)
+    h = w.health(con, "autoplius")
     assert h["failures"] == 2 and h["stale"] and h["new_24h"] == 9
 
 
 def test_health_without_tables_is_none():
-    assert w.health(sqlite3.connect(":memory:")) is None
+    assert w.health(sqlite3.connect(":memory:"), "autoplius") is None

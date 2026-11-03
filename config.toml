@@ -9,10 +9,11 @@ database = "data/autoplius.db"
 
 [autoplius]
 enabled = true
-delay = 1.0              # seconds between page batches
-concurrency = 3          # pages fetched in parallel per batch
+delay = 2.0              # seconds between requests (faster got HTTP 429 + a CAPTCHA)
+concurrency = 1          # pages fetched in parallel per batch
 max_age_days = 7         # re-scrape a model once it is older than this
 empty_max_age_days = 30  # re-check models that had no listings this often
+nightly_limit = 500      # models per nightly run, oldest first (~a full pass a week)
 description_delay = 2.0  # seconds between ad-page requests
 block_threshold = 8      # consecutive refusals before a run stops
 

@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import autoplius_db as db
+from collectors import autoplius as db
+from collectors import crawl
+from collectors.common import BlockDetector, name_slug, title_fits
+from collectors.store import Store
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +54,7 @@ def test_catalogue_of_a_refused_page_is_empty():
     ("ID.4", "id-4"),
 ])
 def test_name_slug(name, key):
-    assert db.name_slug(name) == key
+    assert name_slug(name) == key
 
 
 def test_make_counts_from_home_page(page):
@@ -65,8 +68,8 @@ def test_make_counts_from_home_page(page):
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def store(tmp_path):
-    s = db.Store(tmp_path / "test.db")
-    yield s
+    s = Store(tmp_path / "test.db")
+    yield s.site("autoplius")
     s.close()
 
 
@@ -89,7 +92,7 @@ def test_sync_keeps_progress_of_existing_models(store):
                VALUES ('https://old/bmw/320', 'bmw', '320', '2026-10-28T00:00:00+00:00', 690)""")
         store.conn.commit()
     updated, added = store.sync_catalogue([entry("bmw", "320", 10941, 97),
-                                           entry("bmw", "x7", 555, 97)])
+                                           entry("bmw", "x7", 555, 97)], db.catalogue_url)
     assert (updated, added) == (1, 1)
     rows = models(store)
     assert rows[1][:2] == ("bmw", "320")
@@ -99,24 +102,24 @@ def test_sync_keeps_progress_of_existing_models(store):
 
 
 def test_resync_does_not_re_enable_switched_off_models(store):
-    store.sync_catalogue([entry("bmw", "320", 1)])
+    store.sync_catalogue([entry("bmw", "320", 1)], db.catalogue_url)
     with store.lock:
         store.conn.execute("UPDATE models SET enabled = 0")
         store.conn.commit()
-    store.sync_catalogue([entry("bmw", "320", 1)])
+    store.sync_catalogue([entry("bmw", "320", 1)], db.catalogue_url)
     assert models(store)[0][4] == 0
 
 
 def test_one_name_with_two_ids_gives_two_rows(store):
-    store.sync_catalogue([entry("volkswagen", "lt", 10987), entry("volkswagen", "lt", 30587)])
-    store.sync_catalogue([entry("volkswagen", "lt", 10987), entry("volkswagen", "lt", 30587)])
+    store.sync_catalogue([entry("volkswagen", "lt", 10987), entry("volkswagen", "lt", 30587)], db.catalogue_url)
+    store.sync_catalogue([entry("volkswagen", "lt", 10987), entry("volkswagen", "lt", 30587)], db.catalogue_url)
     assert [r[3] for r in models(store)] == [10987, 30587]
 
 
 def test_pending_models_cadence(store):
     store.sync_catalogue([entry("a", "busy-recent", 1), entry("a", "busy-old", 2),
                           entry("a", "empty-old", 3), entry("a", "empty-ancient", 4),
-                          entry("a", "never", 5), entry("a", "switched-off", 6)])
+                          entry("a", "never", 5), entry("a", "switched-off", 6)], db.catalogue_url)
     with store.lock:
         for model_id, days, found in [(1, 2, 50), (2, 10, 50), (3, 10, 0), (4, 40, 0),
                                       (6, 40, 50)]:
@@ -145,7 +148,7 @@ KNOWN = ["320", "320-gran-turismo", "318", "x5"]
     ("BMW Alpina B3", True),                # a name we don't know: trust the id search
 ])
 def test_title_fits(title, fits):
-    assert db.title_fits(title, "bmw", "320", KNOWN) is fits
+    assert title_fits(title, "bmw", "320", KNOWN) is fits
 
 
 def search_args(**kw):
@@ -153,21 +156,21 @@ def search_args(**kw):
 
 
 def test_small_model_costs_one_request(store, page, monkeypatch):
-    store.sync_catalogue([entry("bmw", m, i, 97) for i, m in enumerate(KNOWN, start=1)])
+    store.sync_catalogue([entry("bmw", m, i, 97) for i, m in enumerate(KNOWN, start=1)], db.catalogue_url)
     html = page("autoplius/results_bmw_320_damaged.html")       # 17 BMW 320s, one page
     calls = []
-    monkeypatch.setattr(db, "fetch", lambda s, url, **kw: calls.append(url) or html)
-    ids, complete = db.scrape_search("https://x/?model_id=1", "bmw", "320", store,
-                                     None, db.BlockDetector(), search_args())
+    monkeypatch.setattr(crawl, "fetch", lambda s, url, **kw: calls.append(url) or html)
+    ids, complete = crawl.scrape_search(db, "https://x/?model_id=1", "bmw", "320", store,
+                                        None, BlockDetector(), search_args())
     assert complete and len(ids) == 17 and len(calls) == 1
 
 
 def test_empty_search_stops_at_once(store, monkeypatch):
     html = '<span class="result-count"> (0)</span>' + \
         '<a class="announcement-item" href="/skelbimai/audi-a6-1.html">Audi A6 2015 9 000 €</a>'
-    monkeypatch.setattr(db, "fetch", lambda *a, **kw: html)
-    ids, complete = db.scrape_search("https://x/", "bmw", "320", store, None,
-                                     db.BlockDetector(), search_args())
+    monkeypatch.setattr(crawl, "fetch", lambda *a, **kw: html)
+    ids, complete = crawl.scrape_search(db, "https://x/", "bmw", "320", store, None,
+                                        BlockDetector(), search_args())
     assert complete and not ids
 
 

@@ -1,48 +1,31 @@
-#!/usr/bin/env python3
 """
-watch_new_listings.py — catch every new Autoplius ad within minutes.
+collectors/watch.py — catch every new ad on a site within minutes.
 
-Each scan walks the site's newest-first list ("Naujausi viršuje") page by page
-and stops only once a WHOLE page holds nothing but ads it already knows, plus
-one more page as a margin. So:
+Each scan walks the site's newest-first list page by page and stops only once
+a WHOLE page holds nothing but ads it already knows, plus `margin_pages` more:
 
-  * a quiet night costs two page requests; a busy hour simply reads further;
+  * a quiet period costs two page requests; a busy hour simply reads further;
   * after downtime (PC off, site refusing) the next good scan walks back to
     where it left off, up to a safety cap (watcher.max_pages, ~a day of ads);
   * "raised" / promoted ads mixed into the list can't end a scan early,
     because one known ad on a page is never the stop signal, a fully known
     page is.
 
-New ads go straight into data/autoplius.db with every card field, and are
-priced at once with the saved pooled model (written by autoplius_stats.py).
-A new car under the low end of its range has its ad page read immediately and
-gets a verdict: deal / damaged / problem / not a real price. These land in the
-new_deals table, which the dashboard shows.
+New ads go straight into the database with every card field, and are priced
+at once with the saved pooled model (written by autoplius_stats.py). A new car
+under the low end of its range has its ad page read immediately and gets a
+verdict: deal / damaged / problem / not a real price, in the new_deals table.
+Every scan is recorded in watch_scans, so a watcher that silently fails shows
+up on the dashboard.
 
-Every scan is recorded in watch_scans, so a watcher that silently fails
-shows up on the dashboard.
-
-    python scripts/watch_new_listings.py              # run every 5 minutes
-    python scripts/watch_new_listings.py --once       # one scan, then exit
-    python scripts/watch_new_listings.py --verify 6   # are the last 6 h of ads all in the DB?
+`site` is a site module (collectors.autoplius); see scripts/watch.py.
 """
 
-import argparse
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-import requests
-
-import autoplius_db as site
-from autoplius_db import (BASE, DEFAULT_SEARCH, BlockDetector, Store, card_ages,
-                          fetch, fetch_ad_details, normalized_label, page_url,
-                          scrape_page)
-from settings import SETTINGS, project_path
-
-CFG = SETTINGS["watcher"]
-SOURCE = "autoplius"
-NEWEST_URL = f"{DEFAULT_SEARCH}?order_by=3&order_direction=DESC"
+from collectors.common import DATA_DIR, BlockDetector, fetch, name_slug, normalized_label
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch_scans (
@@ -103,12 +86,18 @@ def iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
-slug = site.name_slug
+slug = name_slug
 
 
 # --------------------------------------------------------------------------- #
+
+
 # make / model from a card title
+
+
 # --------------------------------------------------------------------------- #
+
+
 class ModelResolver:
     """
     Card titles ("Mercedes-Benz GLK320", "Volkswagen Caddy Maxi") to the
@@ -149,13 +138,19 @@ class ModelResolver:
 
 
 # --------------------------------------------------------------------------- #
+
+
 # the walk
+
+
 # --------------------------------------------------------------------------- #
-def walk(get_page, is_known, margin_pages=1, max_pages=50):
+
+
+def walk(site, get_page, is_known, margin_pages=1, max_pages=50):
     """
     Read newest-first pages until a page holds only known ads, then
     `margin_pages` more. `get_page(n)` returns that page's HTML ("" = failed);
-    `is_known(id)` says whether an ad is already stored.
+    `is_known(id)` says whether an ad is already stored; `site` parses pages.
 
     Returns {"rows": {id: row} of NEW ads in page order, "ages": {id: minutes},
     "seen": count, "pages": n, "reached_known", "hit_cap", "failed"}.
@@ -166,12 +161,12 @@ def walk(get_page, is_known, margin_pages=1, max_pages=50):
               "hit_cap": False, "failed": False}
     for page in range(1, max_pages + 1):
         html = get_page(page)
-        rows = list(scrape_page(html)) if html else []
+        rows = list(site.scrape_page(html)) if html else []
         if not rows:                     # refused, empty or not a results page
             result["failed"] = True
             break
         result["pages"] = page
-        ages.update(card_ages(html))
+        ages.update(site.card_ages(html))
         fresh = 0
         for row in rows:
             seen.add(row["id"])
@@ -190,8 +185,14 @@ def walk(get_page, is_known, margin_pages=1, max_pages=50):
 
 
 # --------------------------------------------------------------------------- #
+
+
 # verdicts
+
+
 # --------------------------------------------------------------------------- #
+
+
 def verdict(price, lo, mid, details=None, title=None, description=None, read=False):
     """
     What a new ad priced under its range really is.
@@ -215,33 +216,39 @@ def verdict(price, lo, mid, details=None, title=None, description=None, read=Fal
 
 
 # --------------------------------------------------------------------------- #
+
+
 # database side
+
+
 # --------------------------------------------------------------------------- #
+
+
 class WatchStore:
-    def __init__(self, store):
-        self.store = store
+    """The watcher's tables (watch_scans, watch_seen, new_deals) for one site."""
+
+    def __init__(self, store, source):
+        self.store, self.source = store, source
+        self.db = store.site(source)
         with store.lock:
             store.conn.executescript(SCHEMA)
             store.conn.commit()
 
     def model_pairs(self):
-        with self.store.lock:
-            return self.store.conn.execute(
-                """SELECT make, model FROM models
-                   UNION SELECT DISTINCT make, model FROM listings""").fetchall()
+        return self.db.model_pairs()
 
     def is_known(self, ad_id):
         with self.store.lock:
             return self.store.conn.execute(
-                """SELECT 1 FROM listings WHERE id = ?
+                """SELECT 1 FROM listings WHERE source = ? AND id = ?
                    UNION ALL SELECT 1 FROM watch_seen WHERE source = ? AND id = ?
-                   LIMIT 1""", (ad_id, SOURCE, ad_id)).fetchone() is not None
+                   LIMIT 1""", (self.source, ad_id, self.source, ad_id)).fetchone() is not None
 
     def mark_seen(self, rows, ages, found):
         with self.store.lock:
             self.store.conn.executemany(
                 "INSERT OR IGNORE INTO watch_seen VALUES (?,?,?,?)",
-                [(SOURCE, ad_id, iso(found),
+                [(self.source, ad_id, iso(found),
                   iso(found - timedelta(minutes=ages[ad_id])) if ad_id in ages else None)
                  for ad_id in rows])
             self.store.conn.commit()
@@ -253,7 +260,7 @@ class WatchStore:
                 """INSERT INTO watch_scans (source, started_at, finished_at, status,
                        pages, seen, new, reached_known, hit_cap, oldest_age_min, message)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (SOURCE, iso(started), iso(now_utc()),
+                (self.source, iso(started), iso(now_utc()),
                  "failed" if result["failed"] and not result["pages"] else "ok",
                  result["pages"], result.get("seen", 0), new,
                  int(result["reached_known"]), int(result["hit_cap"]), oldest, message))
@@ -264,13 +271,13 @@ class WatchStore:
             self.store.conn.execute(
                 """INSERT OR REPLACE INTO new_deals VALUES
                    (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (SOURCE, row["id"], iso(found), make, model, row["title"],
+                (self.source, row["id"], iso(found), make, model, row["title"],
                  row["year"] or None, row["mileage_km"] or None, row["price_eur"],
                  round(lo), round(mid), round(hi), verdict_, "|".join(flags), row["link"]))
             self.store.conn.commit()
 
 
-def health(conn, source=SOURCE, stale_minutes=15):
+def health(conn, source, stale_minutes=15):
     """Watcher health for the dashboard, from watch_scans / new_deals.
     `conn` is any sqlite3 connection to the main database."""
     try:
@@ -313,8 +320,14 @@ def health(conn, source=SOURCE, stale_minutes=15):
 
 
 # --------------------------------------------------------------------------- #
+
+
 # one scan
+
+
 # --------------------------------------------------------------------------- #
+
+
 def load_scoring():
     """The saved price model and generation table, or (None, None)."""
     try:
@@ -327,7 +340,7 @@ def load_scoring():
     return model, compiled
 
 
-def scan(session, store, watch, model, compiled, args):
+def scan(site, session, store, watch, model, compiled, args):
     started = now_utc()
     blocks = BlockDetector(threshold=3)
     resolver = ModelResolver(watch.model_pairs())
@@ -335,9 +348,9 @@ def scan(session, store, watch, model, compiled, args):
     def get_page(n):
         if n > 1:
             time.sleep(args.delay)
-        return fetch(session, page_url(NEWEST_URL, n), blocks=blocks)
+        return fetch(session, site.page_url(site.newest_url, n), blocks=blocks)
 
-    result = walk(get_page, watch.is_known, args.margin_pages, args.max_pages)
+    result = walk(site, get_page, watch.is_known, args.margin_pages, args.max_pages)
     new = result["rows"]
     found = now_utc()
 
@@ -348,10 +361,10 @@ def scan(session, store, watch, model, compiled, args):
             continue
         guessed += not known_model
         rows.append({**row, "_make": make, "_model": model_name})
-    store.upsert_many(rows, None, None)
+    watch.db.upsert_many(rows, None, None)
     watch.mark_seen(new, result["ages"], found)
 
-    deals = score_new(session, store, watch, rows, model, compiled, found, blocks, args)
+    deals = score_new(site, session, watch, rows, model, compiled, found, blocks, args)
 
     if result["failed"] and not result["pages"]:
         message = "No results page could be read; nothing changed."
@@ -367,11 +380,11 @@ def scan(session, store, watch, model, compiled, args):
     watch.record_scan(started, result, len(new), message)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
     if blocks.tripped.is_set():
-        print("  ! Autoplius refused repeated requests this scan.", file=sys.stderr)
+        print(f"  ! {site.SOURCE} refused repeated requests this scan.", file=sys.stderr)
     return result
 
 
-def score_new(session, store, watch, rows, model, compiled, found, blocks, args):
+def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
     """Price new ads; read the ad of each one under its range; record verdicts."""
     if model is None or not rows:
         return 0
@@ -380,11 +393,12 @@ def score_new(session, store, watch, rows, model, compiled, found, blocks, args)
     for row in rows:
         if row["price_eur"] == "" or not row["year"]:
             continue
-        car = {"make": row["_make"], "model": row["_model"], "year": row["year"],
+        make, model_name = watch.db.canonical(row["_make"], row["_model"])
+        car = {"make": make, "model": model_name, "year": row["year"],
                "mileage_km": row["mileage_km"] or None, "fuel": row["fuel"],
                "engine_l": row["engine_l"], "power_kw": row["power_kw"],
                "gearbox": row["gearbox"], "body": row["body"], "dealer": row["dealer"],
-               "gen": generation_for(row["_make"], row["_model"], row["year"], compiled)}
+               "gen": generation_for(make, model_name, row["year"], compiled)}
         if not model.knows(car):          # never trained on this model: no verdict
             continue
         lo, mid, hi = model.price(car)
@@ -395,31 +409,37 @@ def score_new(session, store, watch, rows, model, compiled, found, blocks, args)
         if args.read_cheap_ads and mid and row["price_eur"] >= IMPLAUSIBLE_SHARE * mid \
                 and not blocks.tripped.is_set():
             time.sleep(args.delay)
-            description, details, read, _ = fetch_ad_details(session, row["link"], blocks)
+            description, details, read, _ = site.fetch_ad_details(session, row["link"], blocks)
             if read:
-                store.save_description(row["id"], description, details)
+                watch.db.save_description(row["id"], description, details)
         v, flags = verdict(row["price_eur"], lo, mid, details, row["title"], description, read)
-        watch.record_deal(row, row["_make"], row["_model"], found, lo, mid, hi, v, flags)
+        watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags)
         print(f"  {v.upper():<16} {row['title']} {row['year']} €{row['price_eur']:,} "
               f"(expected €{mid:,.0f}, low end €{lo:,.0f}) {row['link']}", flush=True)
     return cheap
 
 
 # --------------------------------------------------------------------------- #
+
+
 # verify: are the last N hours really all in the database?
+
+
 # --------------------------------------------------------------------------- #
-def verify(session, store, watch, hours, delay):
+
+
+def verify(site, session, watch, hours, delay):
     """Walk the newest-first list back `hours` (by the cards' age badges) and
     list every ad that is not in the database. Read-only."""
     limit, checked, missing = hours * 60, 0, []
     blocks = BlockDetector(threshold=3)
     for page in range(1, 500):
-        html = fetch(session, page_url(NEWEST_URL, page), blocks=blocks)
-        rows = list(scrape_page(html)) if html else []
+        html = fetch(session, site.page_url(site.newest_url, page), blocks=blocks)
+        rows = list(site.scrape_page(html)) if html else []
         if not rows:
             print("Could not read page", page, "- result is partial.")
             break
-        ages = card_ages(html)
+        ages = site.card_ages(html)
         for row in rows:
             age = ages.get(row["id"])
             if age is not None and age > limit:
@@ -438,69 +458,9 @@ def verify(session, store, watch, hours, delay):
     return missing
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Catch every new Autoplius ad and store it in the database.")
-    ap.add_argument("--db", default=str(project_path(SETTINGS["paths"]["database"])))
-    ap.add_argument("--interval-minutes", type=float, default=CFG["interval_minutes"])
-    ap.add_argument("--margin-pages", type=int, default=CFG["margin_pages"])
-    ap.add_argument("--max-pages", type=int, default=CFG["max_pages"])
-    ap.add_argument("--delay", type=float, default=CFG["delay"])
-    ap.add_argument("--no-read", dest="read_cheap_ads", action="store_false",
-                    default=CFG["read_cheap_ads"],
-                    help="don't open the ads of cheap new cars")
-    ap.add_argument("--once", action="store_true", help="run one scan and exit")
-    ap.add_argument("--verify", type=float, metavar="HOURS",
-                    help="check that every ad from the last HOURS is in the database")
-    args = ap.parse_args()
-    if args.interval_minutes <= 0 or args.max_pages < 1 or args.margin_pages < 0:
-        ap.error("interval must be > 0, max pages >= 1, margin pages >= 0")
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except (AttributeError, OSError):
-            pass
-
-    store = Store(args.db)
-    watch = WatchStore(store)
-    session = requests.Session()
+def model_mtime():
     try:
-        if args.verify:
-            verify(session, store, watch, args.verify, args.delay)
-            return
-        model, compiled = load_scoring()
-        model_mtime = _model_mtime()
-        print(f"Watching {NEWEST_URL} every {args.interval_minutes:g} min "
-              f"(stop after {args.margin_pages + 1} fully known page(s), "
-              f"cap {args.max_pages} pages).")
-        print("New ads are priced " + ("with the saved model." if model else
-              "- no saved model yet: run autoplius_stats.py once to enable deal checks."))
-        while True:
-            started = time.monotonic()
-            if _model_mtime() != model_mtime:      # report rebuilt: pick up the new model
-                model, compiled = load_scoring()
-                model_mtime = _model_mtime()
-            try:
-                scan(session, store, watch, model, compiled, args)
-            except requests.RequestException as exc:
-                print(f"  ! scan failed: {exc}", file=sys.stderr)
-            if args.once:
-                break
-            wait = args.interval_minutes * 60 - (time.monotonic() - started)
-            time.sleep(max(5.0, wait))
-    except KeyboardInterrupt:
-        print("\nWatcher stopped.")
-    finally:
-        session.close()
-        store.close()
-
-
-def _model_mtime():
-    try:
-        return (site.DATA_DIR / "price_model" / "meta.json").stat().st_mtime
+        return (DATA_DIR / "price_model" / "meta.json").stat().st_mtime
     except OSError:
         return None
 
-
-if __name__ == "__main__":
-    main()

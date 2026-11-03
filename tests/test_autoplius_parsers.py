@@ -5,8 +5,8 @@ The values asserted here were read off those exact pages. If Autoplius changes
 its layout, refresh the fixture and these tests show which field broke.
 """
 
-import autoplius_db as db
-import autoplius_scraper as csv_scraper
+from collectors import autoplius as db
+from collectors.common import resolve_model_from_title
 
 
 def test_results_page_parses_every_card(page):
@@ -91,11 +91,6 @@ def test_damaged_url_ors_every_defect_type():
     assert "10924" not in url            # "Be defektų" must never be included
 
 
-def test_csv_scraper_reads_cards(page):
-    rows = list(csv_scraper.scrape_page(page("autoplius/results_bmw_320.html")))
-    assert len(rows) == 20
-
-
 def test_parse_price_refuses_lease_figures():
     assert db.parse_price("22 750 €") == 22750
     assert db.parse_price("22 750 € nuo 259 € / mėn.") == 22750
@@ -111,6 +106,6 @@ def test_from_slug():
 
 def test_resolve_model_from_title():
     models = ["3", "320", "320d", "x5"]
-    assert db.resolve_model_from_title("BMW 320", "bmw", models) == "320"
-    assert db.resolve_model_from_title("BMW 320d Touring", "bmw", models) == "320d"
-    assert db.resolve_model_from_title("Audi A4", "bmw", models) is None
+    assert resolve_model_from_title("BMW 320", "bmw", models) == "320"
+    assert resolve_model_from_title("BMW 320d Touring", "bmw", models) == "320d"
+    assert resolve_model_from_title("Audi A4", "bmw", models) is None

@@ -10,7 +10,7 @@ import autoplius_stats as st
 
 
 def car(i, model, seen, first=None, count=2):
-    return {"id": str(i), "make": "bmw", "model": model,
+    return {"source": "autoplius", "id": str(i), "make": "bmw", "model": model,
             "first_seen": (first or seen).isoformat(), "last_seen": seen.isoformat(),
             "seen_count": count}
 
@@ -23,7 +23,7 @@ def test_gone_is_measured_against_the_full_scrape():
         car(3, "320", scrape + timedelta(days=2)),       # inserted by the watcher later
         car(4, "x7", scrape + timedelta(days=2)),        # model never fully scraped
     ]
-    st.mark_disappeared(cars, {("bmw", "320"): scrape})
+    st.mark_disappeared(cars, {("autoplius", "bmw", "320"): scrape})
     assert [c["gone"] for c in cars] == [False, True, False, False]
 
 
@@ -31,7 +31,7 @@ def test_a_new_watcher_ad_does_not_make_the_model_look_sold():
     scrape = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
     cars = [car(i, "320", scrape - timedelta(minutes=5)) for i in range(5)]
     cars.append(car(99, "320", scrape + timedelta(days=4)))
-    st.mark_disappeared(cars, {("bmw", "320"): scrape})
+    st.mark_disappeared(cars, {("autoplius", "bmw", "320"): scrape})
     assert not any(c["gone"] for c in cars)
 
 

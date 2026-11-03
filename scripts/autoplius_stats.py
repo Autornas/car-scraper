@@ -43,6 +43,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from collectors.store import Store
 from settings import SETTINGS, project_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -585,7 +586,7 @@ def parse_ts(value):
 
 def load(db_path, compiled, min_price, max_price):
     if not Path(db_path).exists():
-        sys.exit(f"No database at {db_path}. Run scripts/autoplius_db.py first.")
+        sys.exit(f"No database at {db_path}. Run scripts/scrape.py first.")
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     # Everything is fetched, including rows we will drop, so the skip counts below
@@ -593,21 +594,21 @@ def load(db_path, compiled, min_price, max_price):
     listing_columns = {
         row[1] for row in con.execute("PRAGMA table_info(listings)")
     }
-    # Columns added by later versions of autoplius_db.py read as NULL on an
+    # Columns added by later versions of the scraper read as NULL on an
     # older database, so the report still builds before it is re-scraped.
     optional = ("description", "description_checked_at", "power_kw", "gearbox",
                 "body", "location", "dealer", "damaged", "damage_type", "reg_country")
     extra_columns = ", ".join(
         name if name in listing_columns else f"NULL AS {name}" for name in optional)
-    rows = con.execute(f"""SELECT id, make, model, title, year, price_eur, mileage_km,
+    rows = con.execute(f"""SELECT source, id, make, model, title, year, price_eur, mileage_km,
                                   fuel, engine_l, link, first_seen, last_seen, seen_count,
                                   {extra_columns}
                            FROM listings""").fetchall()
     # Only the FIRST recorded price is ever used. SQLite takes the bare price_eur
     # from the same row that produced MIN(seen_at), so this needs no sort.
-    first_price = {r[0]: r[2] for r in
-                   con.execute("SELECT id, MIN(seen_at), price_eur "
-                               "FROM price_history GROUP BY id")}
+    first_price = {(r[0], r[1]): r[3] for r in
+                   con.execute("SELECT source, id, MIN(seen_at), price_eur "
+                               "FROM price_history GROUP BY source, id")}
     con.close()
 
     skipped = defaultdict(int)
@@ -647,7 +648,7 @@ def load(db_path, compiled, min_price, max_price):
             + text_flags(c["title"], c["description"])
         c["suspect"] = bool(c["flags"])
 
-        first = first_price.get(c["id"], c["price_eur"])
+        first = first_price.get((c["source"], c["id"]), c["price_eur"])
         c["first_price"] = first
         c["drop_pct"] = round((first - c["price_eur"]) / first * 100, 1) \
             if first and first > c["price_eur"] else 0.0
@@ -698,11 +699,19 @@ def assign_groups(cars, bucket, min_n):
 
 
 def model_scrape_times(db_path):
-    """(make, model) -> when its last FULL scrape finished (models.last_scraped)."""
+    """(source, make, model) -> when its last FULL scrape finished
+    (models.last_scraped), under the canonical make/model listings use."""
     con = sqlite3.connect(db_path)
     try:
-        return {(mk, md): parse_ts(ts) for mk, md, ts in
-                con.execute("SELECT make, model, last_scraped FROM models")}
+        out = {}
+        for src, mk, md, ts in con.execute("""SELECT m.source, COALESCE(a.make, m.make), COALESCE(a.model, m.model),
+                      m.last_scraped
+               FROM models m LEFT JOIN model_aliases a
+                 ON a.source = m.source AND a.site_make = m.make AND a.site_model = m.model"""):
+            t = parse_ts(ts)
+            if t and (out.get((src, mk, md)) is None or t > out[(src, mk, md)]):
+                out[(src, mk, md)] = t
+        return out
     except sqlite3.Error:
         return {}
     finally:
@@ -723,7 +732,7 @@ def mark_disappeared(cars, scraped):
     for c in cars:
         seen = parse_ts(c["last_seen"])
         first = parse_ts(c["first_seen"])
-        ref = scraped.get((c["make"], c["model"]))
+        ref = scraped.get((c["source"], c["make"], c["model"]))
         c["gone"] = bool(seen and ref and (ref - seen).total_seconds() > 3600)
         # A listing seen in only ONE scrape carries no duration information:
         # first_seen == last_seen, so the difference is 0 however long it was
@@ -1076,7 +1085,9 @@ const ENT = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ENT[c]);
 const eur = n => n==null ? "—" : "€"+Math.round(n).toLocaleString("en-US");
 const num = n => n==null ? "—" : Math.round(n).toLocaleString("en-US");
-const href = p => "https://autoplius.lt/skelbimai/" + encodeURI(String(p||""));
+/* Autoplius links are stored without their common prefix to keep the page small. */
+const href = p => /^https?:/.test(String(p||"")) ? String(p)
+  : "https://autoplius.lt/skelbimai/" + encodeURI(String(p||""));
 const alink = p => p ? `<a class="open" href="${esc(href(p))}" target="_blank" rel="noopener">Open ↗</a>` : "—";
 const cap = s => s ? s.charAt(0).toUpperCase()+s.slice(1) : "";
 /* "a6", "xc60", "rav4" read best upper-case; "passat" reads best as "Passat". */
@@ -1562,6 +1573,7 @@ def main():
     bucket = max(1, args.bucket)
     min_n = max(1, args.min_n)
 
+    Store(args.db).close()            # creates or upgrades the database layout
     compiled = compile_generations(ensure_generations(args.generations))
     cars, skipped = load(args.db, compiled, args.min_price, args.max_price)
     if not cars:
@@ -1600,7 +1612,7 @@ def main():
         packed.append([
             c["make"], c["model"], c["grp"], c["year"], c["price_eur"],
             c["mileage_km"], c["fuel"] or "", c["engine_l"] or "",
-            (c["link"] or "").replace(prefix, ""), kmr, c["drop_pct"],
+            (c["link"] or "").removeprefix(prefix), kmr, c["drop_pct"],
             c["first_price"], c["days"], 1 if c["gone"] else 0,
             round(exp) if exp else None,
             1 if c.get("price_outlier") else 0,
@@ -1611,7 +1623,7 @@ def main():
             "|".join(c["flags"]), c.get("location") or "", c.get("dealer")])
 
     # Cheapest-looking cars nobody has read yet: these are what the targeted
-    # description fetch (autoplius_db.py --ids-file) should spend requests on.
+    # description fetch (scrape.py --ids-file) should spend requests on.
     # Already-flagged cars are left out — they have their answer.
     def under(c):
         base = c["lo"] or c["exp"]
@@ -1624,7 +1636,7 @@ def main():
     with cand_path.open("w", encoding="utf-8") as fh:
         fh.write("# id  price  expected-low  (best first) - written by autoplius_stats.py\n")
         for c in unread[:args.candidates]:
-            fh.write(f"{c['id']}  {c['price_eur']}  {round(c['lo'] or c['exp'])}  "
+            fh.write(f"{c['source']}:{c['id']}  {c['price_eur']}  {round(c['lo'] or c['exp'])}  "
                      f"{c['make']}/{c['model']} {c['year']}\n")
 
     bad_mileage = skipped.pop("impossible mileage", 0)
