@@ -114,10 +114,10 @@ open; Ctrl+C stops the dashboard and active task. It has three sections:
   Groups show their cars next to them (stacked on narrower screens). The
   report is rebuilt automatically if the database changed; **Reload report**
   picks up new data.
-- **Models**: the model list the database scraper covers. Add or remove one
-  `make/model` pair per line (for example `audi/a3`), then save. New entries
-  are queued for scraping; removed ones stop being scraped but keep their
-  saved listings and price history.
+- **Models**: which of the site's models the database scraper covers. It
+  starts as every make and model on Autoplius; remove a `make/model` line to
+  switch that model off (its saved listings stay), add it back to switch it
+  on. Only names from the site's catalogue are accepted.
 
 The dashboard displays a dismissible pop-up if a scraper reports common access
 or runtime errors, exits unsuccessfully, or if the watcher stops unexpectedly.
@@ -131,10 +131,47 @@ to wait before resuming.
 
 The database scraper stores listings, seller descriptions, and price history
 in `data/autoplius.db`. From each result card it also saves power (kW),
-gearbox, body type, town and whether the seller is a dealer. After each model
-it runs one extra search using Autoplius' own "Defektai" filter (damaged,
-burnt, flooded, hail, engine/gearbox defect, other major defects) and marks
-those listings `damaged = 1`, the rest of the model `damaged = 0`.
+gearbox, body type, town and whether the seller is a dealer.
+
+**Which models.** The scraper covers Autoplius' whole make/model catalogue
+(~3,200 models across ~200 makes), read from one page of the site and synced
+automatically once a week (`--refresh-models` forces it). Every search goes by
+the site's own `make_id` / `model_id`, never by URL names: the old name-based
+URLs for makes with a hyphen (`mercedes-benz`, `land-rover`) and models like
+`ct-200h` had quietly started returning the whole site, which is why Mercedes
+was almost missing. Page 1 of each search is read first and its result count
+decides how many more pages to fetch, so a small model costs one request.
+Models are re-scraped after 7 days (`autoplius.max_age_days`); models with no
+ads only every 30 days (`empty_max_age_days`).
+
+**Damage sweep.** After scraping, one site-wide search with Autoplius' own
+"Defektai" filter (damaged, burnt, flooded, hail, engine or gearbox defect,
+other major defects) reads every car with a declared defect, about 2,300 cars
+on ~120 pages, and marks them `damaged = 1`, every other listing `0`. To run
+only the sweep:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\autoplius_db.py --damage-sweep
+```
+
+**Coverage.** `--coverage` compares the site's live per-make counts with the
+database and lists the biggest gaps:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\autoplius_db.py --coverage
+```
+
+**Nightly refresh.** `scripts/nightly.py` re-scrapes whatever is due, runs the
+damage sweep and rebuilds the report and price model (a running watcher picks
+the new model up). To have Windows run it every night at 03:30:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_nightly_task.ps1
+```
+
+`-At 04:00` changes the time and `-Remove` deletes the task. It runs while you
+are signed in and catches up at the next sign-in if the PC was off. Logs go to
+`data/logs/`.
 
 Descriptions are no longer fetched for every listing after a scrape (one
 request per ad, tens of hours for a full database). They are fetched for the
@@ -151,12 +188,6 @@ unread cars relative to their expected price, best first (`--candidates N`,
 default 300). Fetching an ad also reads its parameter table (kW, gearbox,
 body, declared defect, first-registration country). Use `--all-descriptions`
 on a scrape to restore the old fetch-everything behaviour.
-
-To flag damaged cars in an existing database without re-scraping every model:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\autoplius_db.py --refresh-damage
-```
 
 ## Price model and flags
 
@@ -218,15 +249,14 @@ the watcher, add `--no-watcher`.
 Build the database and report with:
 
 ```powershell
-python scripts/autoplius_db.py --limit 50
+python scripts/autoplius_db.py          # everything due (first run: all ~3,200 models)
 python scripts/autoplius_stats.py --open
 ```
 
 Use `--help` on any tool for its options. Output paths can be changed with the
 tools' path arguments. `data/generations.json` holds editable model-generation
-boundaries. `data/models.txt` is an optional separate curated list for
-`autoplius_db.py --models-file data/models.txt`; it is not the full scraper's
-database inventory.
+boundaries. `autoplius_db.py --models-file data/models.txt` scrapes only the
+`make/model` pairs listed in that file.
 
 Scrapes only pages publicly available to the request. Keep request delays
 reasonable and follow Autoplius' terms.

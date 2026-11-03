@@ -43,7 +43,7 @@ TASKS = {
         _script("watch_new_listings.py")]),
     "start_database": ("database scraper", [_script("autoplius_db.py")]),
     "rescrape_all": ("full re-scrape", [_script("autoplius_db.py", "--force")]),
-    "refresh_damage": ("damage check", [_script("autoplius_db.py", "--refresh-damage")]),
+    "refresh_damage": ("damage check", [_script("autoplius_db.py", "--damage-sweep")]),
     "check_candidates": ("candidate check", [
         _script("autoplius_stats.py"),
         _script("autoplius_db.py", "--backfill-descriptions",
@@ -221,14 +221,14 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
     <button data-action="start_watcher">Start</button></div>
    <div class="group-label">Collect</div>
    <div class="task" data-task="database scraper"><div class="t"><div class="n">Resume scraping</div>
-    <div class="d">Scrapes models not yet scraped or older than 30 days, plus their damaged-car search.</div></div>
+    <div class="d">Every make and model on Autoplius not scraped in the last 7 days, then the damage sweep.</div></div>
     <button data-action="start_database">Start</button></div>
    <div class="task" data-task="full re-scrape"><div class="t"><div class="n">Full re-scrape</div>
-    <div class="d">Every model again — refreshes prices and fills kW, gearbox and body. About 2 hours.</div></div>
-    <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 2 hours.">Start</button></div>
+    <div class="d">Every model again, regardless of age — refreshes every price and car detail. About 3 hours.</div></div>
+    <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 3 hours.">Start</button></div>
    <div class="group-label">Clean up</div>
    <div class="task" data-task="damage check"><div class="t"><div class="n">Flag damaged cars</div>
-    <div class="d">Runs Autoplius' defect filter for each model without re-scraping it. ~20–30 min.</div></div>
+    <div class="d">Autoplius' defect filter across the whole site (~2,300 cars, ~120 pages). ~5 min.</div></div>
     <button data-action="refresh_damage">Start</button></div>
    <div class="task" data-task="candidate check"><div class="t"><div class="n">Check top candidates</div>
     <div class="d">Rebuilds the deal list, reads the 300 best unread ads for defects, rebuilds again. ~15 min.</div></div>
@@ -262,7 +262,7 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 
 <section class="view models" id="v-models" hidden>
  <p>Models the database scraper covers, one <code>make/model</code> per line (for example <code>audi/a3</code>).
- New lines are queued for scraping; removed lines stop being scraped but keep their saved listings.</p>
+ The list starts as every make and model on Autoplius. Remove a line to switch that model off (its saved listings stay); add it back to switch it on. Only names from the site's catalogue are accepted.</p>
  <textarea id="modelsText" spellcheck="false" aria-label="Model list"></textarea>
  <div class="bar"><button class="primary" id="saveModels">Save model list</button>
   <span id="modelsStatus" style="color:var(--muted)">Loading…</span></div>
@@ -465,67 +465,53 @@ loadModels();refresh();setInterval(refresh,2000);
 
 
 def save_database_models(text):
-    """Replace the full-scraper model inventory while preserving existing progress."""
-    if len(text.encode("utf-8")) > 60000:
-        raise ValueError("Model inventory is too large (maximum 60 KB).")
-
-    entries = []
-    seen = set()
+    """
+    Choose which catalogue models the database scraper covers. Listed models
+    are enabled, all others switched off. Nothing is deleted: a switched-off
+    model keeps its listings and history, and the weekly catalogue sync leaves
+    it off.
+    """
+    if len(text.encode("utf-8")) > 200_000:
+        raise ValueError("Model list is too large (maximum 200 KB).")
+    wanted = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
-        if line.startswith("#"):
-            continue
-        parts = line.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Line {line_number}: expected make/model.")
-        make, model = (part.strip().lower() for part in parts)
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", make):
-            raise ValueError(f"Line {line_number}: invalid make name.")
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", model):
-            raise ValueError(f"Line {line_number}: invalid model name.")
-        pair = (make, model)
-        if pair not in seen:
-            seen.add(pair)
-            url = f"https://autoplius.lt/skelbimai/naudoti-automobiliai/{make}/{model}"
-            entries.append((url, make, model))
-        if len(entries) > 1500:
-            raise ValueError("Model inventory may contain at most 1000 entries.")
-    if not entries:
-        raise ValueError("Keep at least one make/model entry in the inventory.")
+        parts = [part.strip().lower() for part in line.split("/")]
+        if len(parts) != 2 or not all(re.fullmatch(r"[\w+-]{1,100}", p) for p in parts):
+            raise ValueError(f"Line {line_number}: expected make/model, e.g. audi/a3.")
+        if tuple(parts) not in wanted:
+            wanted.append(tuple(parts))
+    if not wanted:
+        raise ValueError("Keep at least one make/model in the list.")
 
     store = Store(DB_PATH)
     try:
         with store.lock:
-            current_urls = {
-                row[0] for row in store.conn.execute("SELECT url FROM models")
-            }
-            wanted_urls = {entry[0] for entry in entries}
-            added = len(wanted_urls - current_urls)
-            removed = len(current_urls - wanted_urls)
+            known = {(mk, md) for mk, md in store.conn.execute(
+                "SELECT make, model FROM models")}
+            unknown = [f"{mk}/{md}" for mk, md in wanted if (mk, md) not in known]
+            if unknown:
+                raise ValueError(
+                    "Not in the Autoplius catalogue: " + ", ".join(unknown[:10])
+                    + (f" and {len(unknown) - 10} more" if len(unknown) > 10 else "")
+                    + ". Run 'Resume scraping' once to sync the catalogue.")
+            before = dict(((mk, md), en) for mk, md, en in store.conn.execute(
+                "SELECT make, model, MAX(enabled) FROM models GROUP BY make, model"))
+            store.conn.execute("UPDATE models SET enabled = 0")
             store.conn.executemany(
-                """INSERT INTO models (url, make, model, last_scraped, found)
-                   VALUES (?,?,?,NULL,NULL)
-                   ON CONFLICT(url) DO NOTHING""",
-                entries,
-            )
-            placeholders = ",".join("?" for _ in wanted_urls)
-            store.conn.execute(
-                f"DELETE FROM models WHERE url NOT IN ({placeholders})",
-                tuple(wanted_urls),
-            )
+                "UPDATE models SET enabled = 1 WHERE make = ? AND model = ?", wanted)
             store.conn.commit()
     finally:
         store.close()
-    saved_text = "\n".join(
-        f"{make}/{model}" for _, make, model in entries
-    ) + "\n"
-    message = (
-        f"Saved {len(entries)} model(s): {added} added, {removed} removed. "
-        "Listings already in the database were kept."
-    )
-    return saved_text, len(entries), message
+    keep = set(wanted)
+    added = sum(1 for pair in keep if not before.get(pair))
+    removed = sum(1 for pair, on in before.items() if on and pair not in keep)
+    saved_text = "\n".join(f"{mk}/{md}" for mk, md in sorted(keep)) + "\n"
+    message = (f"{len(keep)} models enabled: {added} switched on, {removed} switched off. "
+               "Listings already in the database were kept.")
+    return saved_text, len(keep), message
 
 
 class JobManager:
@@ -780,7 +766,8 @@ def make_handler(manager):
                 connection = sqlite3.connect(DB_PATH, timeout=5)
                 try:
                     rows = connection.execute(
-                        "SELECT make, model FROM models ORDER BY make, model"
+                        """SELECT DISTINCT make, model FROM models WHERE enabled = 1
+                           ORDER BY make, model"""
                     ).fetchall()
                 except sqlite3.Error as exc:
                     self._send_json(500, {

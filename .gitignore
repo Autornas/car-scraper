@@ -19,3 +19,4 @@ archive/
 .pytest_cache/
 .claude/
 data/price_model/
+data/logs/

@@ -39,6 +39,7 @@ Re-run any time — models already scraped are skipped unless they're stale
 
 import argparse
 import csv
+import json
 import re
 import signal
 import sqlite3
@@ -525,8 +526,10 @@ def _install_sigint_handler():
 # =========================================================================== #
 # Database
 # =========================================================================== #
-SITEMAP_MODELS = f"{BASE}/xml_sitemap/makes_and_models.xml"
-MODEL_PATH_RE = re.compile(r"/skelbimai/naudoti-automobiliai/([^/]+)/([^/]+)/?$")
+# One page carries Autoplius' whole make/model catalogue: the "more models"
+# pop-up embeds every make's models, with the site's own ids, as JSON.
+CATALOGUE_URL = (f"{BASE}/skelbimai/paieska?category_id=2&filter=makes"
+                 "&make_id=97&type=make_combo")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -565,7 +568,30 @@ CREATE TABLE IF NOT EXISTS models (
     found        INTEGER,
     was_capped   INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# Added to `models` when the catalogue arrived. Searches go by the site's ids;
+# `enabled = 0` is a model you switched off, which a catalogue sync never undoes.
+MODEL_COLUMNS = {
+    "make_id": "INTEGER",
+    "model_id": "INTEGER",
+    "make_name": "TEXT",
+    "model_name": "TEXT",
+    "enabled": "INTEGER DEFAULT 1",
+}
+
+
+def ensure_model_columns(connection):
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(models)")}
+    for name, kind in MODEL_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE models ADD COLUMN {name} {kind}")
+    connection.commit()
 
 
 # Columns added after the first schema. NULL always means "not collected yet",
@@ -617,6 +643,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         ensure_description_columns(self.conn)
+        ensure_model_columns(self.conn)
         self.conn.commit()
         self.lock = threading.Lock()
         self.inserted = 0
@@ -738,17 +765,18 @@ class Store:
             )
             self.conn.commit()
 
-    def mark_damage(self, make, model, damaged_ids):
-        """Record one complete damaged-only search for a model: its ids are
-        damaged, every other listing of that model is not."""
+    def apply_damage_sweep(self, damaged_ids):
+        """Record one complete site-wide damaged search: those ids are damaged,
+        every other listing is not, unless its own ad page declared a defect."""
         with self.lock:
+            self.conn.execute("UPDATE listings SET damaged = 0 WHERE damage_type IS NULL")
+            self.conn.executemany("UPDATE listings SET damaged = 1 WHERE id = ?",
+                                  [(i,) for i in damaged_ids])
             self.conn.execute(
-                "UPDATE listings SET damaged = 0 WHERE make = ? AND model = ?",
-                (make, model))
-            self.conn.executemany(
-                "UPDATE listings SET damaged = 1 WHERE id = ?",
-                [(i,) for i in damaged_ids])
+                "INSERT OR REPLACE INTO meta VALUES ('damage_sweep_at', ?)", (now_iso(),))
             self.conn.commit()
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM listings WHERE damaged = 1").fetchone()[0]
 
     def descriptions_remaining(self):
         with self.lock:
@@ -756,25 +784,73 @@ class Store:
                 "SELECT COUNT(*) FROM listings WHERE description_checked_at IS NULL"
             ).fetchone()[0]
 
-    def save_models(self, entries):
+    def sync_catalogue(self, entries):
+        """
+        Merge the site's catalogue into `models`. A model already synced is
+        found by its id; a model from before the catalogue (same make/model
+        name, no id yet) keeps its progress and listings and switches to the
+        id-based URL; anything else is added, enabled and unscraped. A few
+        names carry two ids on the site (VW "LT"); both rows share the name.
+        Returns (updated, added).
+        """
+        updated = added = 0
         with self.lock:
-            self.conn.executemany(
-                """INSERT INTO models (url, make, model, last_scraped, found)
-                   VALUES (?,?,?,NULL,NULL)
-                   ON CONFLICT(url) DO NOTHING""", entries)
+            for e in entries:
+                url = id_url(e["make_id"], e["model_id"])
+                row = self.conn.execute(
+                    "SELECT rowid FROM models WHERE model_id = ?", (e["model_id"],)).fetchone()                     or self.conn.execute(
+                        """SELECT rowid FROM models
+                           WHERE make = ? AND model = ? AND model_id IS NULL""",
+                        (e["make"], e["model"])).fetchone()
+                if row:
+                    self.conn.execute(
+                        """UPDATE models SET url = ?, make_id = ?, model_id = ?,
+                               make_name = ?, model_name = ?
+                           WHERE rowid = ?""",
+                        (url, e["make_id"], e["model_id"], e["make_name"],
+                         e["model_name"], row[0]))
+                    updated += 1
+                else:
+                    self.conn.execute(
+                        """INSERT OR IGNORE INTO models (url, make, model, make_id, model_id,
+                               make_name, model_name, enabled)
+                           VALUES (?,?,?,?,?,?,?,1)""",
+                        (url, e["make"], e["model"], e["make_id"], e["model_id"],
+                         e["make_name"], e["model_name"]))
+                    added += 1
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('catalogue_synced_at', ?)", (now_iso(),))
             self.conn.commit()
+        return updated, added
 
-    def pending_models(self, max_age_days, force):
+    def catalogue_age_days(self):
+        with self.lock:
+            row = self.conn.execute(
+                """SELECT julianday('now') - julianday(value) FROM meta
+                   WHERE key = 'catalogue_synced_at'""").fetchone()
+        return row[0] if row else None
+
+    def pending_models(self, max_age_days, force, empty_max_age_days=30):
+        """Enabled models due for a scrape. A model whose last scrape found no
+        ads (old Mercedes 290 GD and the like) is rechecked only every
+        `empty_max_age_days`, so thousands of empty models don't cost a request
+        each every week."""
         with self.lock:
             if force:
                 rows = self.conn.execute(
-                    "SELECT url, make, model FROM models ORDER BY make, model").fetchall()
+                    """SELECT url, make, model FROM models WHERE enabled = 1
+                       ORDER BY make, model""").fetchall()
             else:
                 rows = self.conn.execute(
                     """SELECT url, make, model FROM models
-                       WHERE last_scraped IS NULL
-                          OR julianday('now') - julianday(last_scraped) > ?
-                       ORDER BY make, model""", (max_age_days,)).fetchall()
+                       WHERE enabled = 1 AND (
+                           last_scraped IS NULL
+                           OR (COALESCE(found, 1) > 0
+                               AND julianday('now') - julianday(last_scraped) > ?)
+                           OR (found = 0
+                               AND julianday('now') - julianday(last_scraped) > ?))
+                       ORDER BY make, model""",
+                    (max_age_days, empty_max_age_days)).fetchall()
         return rows
 
     def models_for_make(self, make):
@@ -821,8 +897,8 @@ def do_diagnose(session):
     targets = [
         ("robots.txt",            f"{BASE}/robots.txt"),
         ("main search page",      f"{BASE}/skelbimai/naudoti-automobiliai"),
-        ("a model page (bmw/320)", f"{BASE}/skelbimai/naudoti-automobiliai/bmw/320"),
-        ("model list sitemap",    SITEMAP_MODELS),
+        ("a model search (bmw/320)", id_url(97, 10941)),
+        ("make/model catalogue",  CATALOGUE_URL),
     ]
     print("Checking what answers this machine:\n")
     ok = []
@@ -849,164 +925,154 @@ def do_diagnose(session):
         print("Everything answered. Re-run the scrape.")
 
 
+def name_slug(text):
+    """"Mercedes-Benz" -> "mercedes-benz", "A klasė" -> "a-klasė": the make/model
+    keys the database uses, built from the site's display names. "+" is kept
+    as "plus", or "Prius+" and "Prius" would share a key."""
+    text = (text or "").lower().replace("+", " plus ")
+    return "-".join("".join(ch if ch.isalnum() else " " for ch in text).split())
+
+
+def id_url(make_id, model_id):
+    return f"{DEFAULT_SEARCH}?make_id={make_id}&model_id={model_id}"
+
+
+def parse_catalogue(html):
+    """Every make and model from the catalogue page:
+    [{"make", "model", "make_id", "model_id", "make_name", "model_name"}, ...].
+    The site's "-Kita-" (other) entries are left out: they have no name to
+    group by."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    makes = {o.get("value"): o.get_text(strip=True)
+             for o in soup.select("#make_id_list option") if o.get("value")}
+    m = re.search(r"new FinnCart\(\s*'make_id'\s*,\s*", html or "")
+    if not m or not makes:
+        return []
+    data, _ = json.JSONDecoder().raw_decode(html[m.end():])
+    entries, seen = [], set()
+    for make_id, models in data.items():
+        make_name = makes.get(make_id)
+        if not make_name or make_name.startswith("-") or not isinstance(models, dict):
+            continue
+        for model_key, model_name in models.items():
+            model_id = int(model_key.lstrip("_"))
+            if not model_name or model_name.strip("-").lower() == "kita" \
+                    or model_name.startswith("-") or model_id in seen:
+                continue
+            seen.add(model_id)
+            entries.append({
+                "make": name_slug(make_name), "model": name_slug(model_name),
+                "make_id": int(make_id), "model_id": model_id,
+                "make_name": make_name, "model_name": model_name,
+            })
+    return entries
+
+
+def fetch_catalogue(session, blocks):
+    print(f"Fetching the make/model catalogue from {CATALOGUE_URL}")
+    return parse_catalogue(fetch(session, CATALOGUE_URL, blocks=blocks))
+
+
 def load_models_file(path):
-    """Read 'make/model' lines, so a blocked sitemap can't stop you."""
-    entries = []
+    """'make/model' lines -> a set of pairs to restrict a run to."""
+    pairs = set()
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "/" not in line:
-            continue
-        make, model = line.split("/", 1)
-        make, model = make.strip().lower(), model.strip().lower()
-        if make and model:
-            entries.append(
-                (f"{BASE}/skelbimai/naudoti-automobiliai/{make}/{model}", make, model))
-    return entries
+        if line and not line.startswith("#") and "/" in line:
+            make, model = line.split("/", 1)
+            pairs.add(f"{make.strip().lower()}/{model.strip().lower()}")
+    return pairs
 
 
-def fetch_models_from_html(session, blocks, delay=1.0):
-    """Fallback: harvest make/model links from the site's own pages."""
-    print("Sitemap unavailable — reading the model list from the site's pages instead.")
-    html = fetch(session, f"{BASE}/skelbimai/naudoti-automobiliai", blocks=blocks)
-    if not html:
-        return []
-
-    def links(page_html):
-        found_models, found_makes = set(), set()
-        soup = BeautifulSoup(page_html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            path = urlparse(a["href"]).path.rstrip("/")
-            m = MODEL_PATH_RE.search(path + "/")
-            if m:
-                found_models.add((m.group(1), m.group(2)))
-                continue
-            m2 = re.search(r"/skelbimai/naudoti-automobiliai/([^/]+)$", path)
-            if m2 and m2.group(1) != "naudoti-automobiliai":
-                found_makes.add(m2.group(1))
-        return found_models, found_makes
-
-    models, makes = links(html)
-    if not models and makes:
-        print(f"  found {len(makes)} makes, fetching their model lists...")
-        for i, mk in enumerate(sorted(makes), start=1):
-            if STOP.is_set() or blocks.tripped.is_set():
-                break
-            sub = fetch(session, f"{BASE}/skelbimai/naudoti-automobiliai/{mk}",
-                        blocks=blocks)
-            if sub:
-                found, _ = links(sub)
-                models |= found
-            if i % 10 == 0:
-                print(f"  ...{i}/{len(makes)} makes, {len(models)} models so far")
-            time.sleep(delay)
-
-    return [(f"{BASE}/skelbimai/naudoti-automobiliai/{mk}/{md}", mk, md)
-            for mk, md in sorted(models)]
-
-
-def fetch_model_list(session, blocks):
-    """Pull make/model search URLs from the site's own sitemap."""
-    print(f"Fetching model list from {SITEMAP_MODELS}")
-    xml = fetch(session, SITEMAP_MODELS, blocks=blocks)
-    if not xml:
-        return []
-    entries, seen = [], set()
-    for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml):
-        m = MODEL_PATH_RE.search(urlparse(loc).path)
-        if not m:
-            continue
-        make, model = m.group(1), m.group(2)
-        url = f"{BASE}/skelbimai/naudoti-automobiliai/{make}/{model}"
-        if url in seen:
-            continue
-        seen.add(url)
-        entries.append((url, make, model))
-    return entries
+def title_fits(title, make, model, known_models):
+    """
+    Does a card belong in this make/model's search? Searches go by the site's
+    own ids, so results are that model; this only guards against the site
+    answering a bad search with unrelated cars (an old slug URL returned all
+    46,676). Reject a card whose title names another make, or names another
+    known model of this make; accept one that names this model or none that
+    we know.
+    """
+    if not normalized_label(title).startswith(normalized_label(make)):
+        return False
+    matched = resolve_model_from_title(title, make, known_models)
+    return matched is None or matched == model
 
 
 def scrape_search(url, make, model, store, session, blocks, args, label=""):
     """
-    Walk pages of one search URL, upserting each page.
+    Walk the pages of one search URL, upserting each page.
 
-    Stops when a batch of pages yields NO NEW ids. That's the only reliable
-    end-of-results signal: autoplius clamps out-of-range page numbers and
-    re-serves page 1, so pages never come back empty — they come back full of
-    listings you've already seen.
+    Page 1 is read alone first: its result count says how many pages exist,
+    so a 5-car model costs one request, not a batch. An empty search ends
+    there. Further pages are fetched `--concurrency` at a time, and the walk
+    still stops when a batch brings no new ids (the site re-serves page 1 for
+    page numbers past the end).
 
-    Note `ids` is per-search, not global, so "no new ids" can't be confused
-    with "already in the database from a previous run".
-
-    Returns (ids_seen, complete) — complete is False if we were cut short by a
-    block or Ctrl-C, so the caller knows not to mark the model as done.
+    Returns (ids_seen, complete). complete is False if a block or Ctrl-C cut
+    the walk short, so the caller knows not to mark the model as done.
     """
     ids = set()
-    page = 1
-    complete = False
-    conc = max(1, args.concurrency)
     known_models = store.models_for_make(make)
+    rejected = 0
 
-    while page <= args.max_pages:
+    def take(html):
+        nonlocal rejected
+        page_rows = list(scrape_page(html))
+        rows = []
+        for row in page_rows:
+            if not title_fits(row.get("title", ""), make, model, known_models):
+                rejected += 1
+                continue
+            row["_make"], row["_model"] = make, model
+            rows.append(row)
+        fresh = [r for r in rows if r["id"] not in ids]
+        ids.update(r["id"] for r in rows)
+        store.upsert_many(fresh, make, model)
+        return len(page_rows), len(fresh)
+
+    if STOP.is_set() or blocks.tripped.is_set():
+        return ids, False
+    first = fetch(session, page_url(url, 1), blocks=blocks)
+    if not first:
+        print(f"    {label}page 1: no response — stopping")
+        return ids, False
+    total = result_count(first)
+    if total == 0:
+        print(f"    {label}no listings")
+        return ids, True
+    on_page, _ = take(first)
+    if not on_page:
+        print(f"    {label}page 1 held no listing cards — stopping")
+        return ids, True
+    last_page = args.max_pages
+    if total:
+        last_page = min(args.max_pages, -(-total // max(on_page, 1)))
+
+    complete = True
+    page = 2
+    conc = max(1, args.concurrency)
+    while page <= last_page:
         if STOP.is_set() or blocks.tripped.is_set():
+            complete = False
             break
-        batch = list(range(page, min(page + conc, args.max_pages + 1)))
+        time.sleep(args.delay)
+        batch = list(range(page, min(page + conc, last_page + 1)))
         with ThreadPoolExecutor(max_workers=len(batch)) as pool:
             htmls = list(pool.map(
                 lambda n: fetch(session, page_url(url, n), blocks=blocks), batch))
-
         if not any(htmls):
             print(f"    {label}pages {batch[0]}-{batch[-1]}: no response — stopping")
+            complete = False
             break
-
-        before = len(ids)
-        saw_empty = False
-        rejected = 0
-        matching = 0
-        for html in htmls:
-            if not html:
-                continue
-            page_rows = list(scrape_page(html))
-            if not page_rows:
-                saw_empty = True
-                continue
-            rows = []
-            for row in page_rows:
-                matched_model = resolve_model_from_title(
-                    row.get("title", ""), make, known_models
-                )
-                if matched_model != model:
-                    rejected += 1
-                    continue
-                row["_make"] = make
-                row["_model"] = matched_model
-                rows.append(row)
-            if not rows:
-                continue
-            matching += len(rows)
-            fresh = [r for r in rows if r["id"] not in ids]
-            ids.update(r["id"] for r in rows)
-            store.upsert_many(fresh, make, model)
-
-        gained = len(ids) - before
-        if rejected:
-            print(f"    {label}ignored {rejected} listing(s) whose title did not "
-                  f"match {make}/{model}")
-        if matching == 0 and not saw_empty:
-            print(f"    {label}no listings matched {make}/{model}; "
-                  "stopping this model rather than saving unrelated results")
-            complete = True
+        gained = sum(take(h)[1] for h in htmls if h)
+        if gained == 0:
             break
-        print(f"    {label}pages {batch[0]}-{batch[-1]}: +{gained} matching "
-              f"({len(ids)} total)")
-
-        if gained == 0 or saw_empty:
-            complete = True
-            break
-
         page += conc
-        time.sleep(args.delay)
-    else:
-        complete = True          # walked the whole allowed range without stopping
 
+    note = f", ignored {rejected} not matching {make}/{model}" if rejected else ""
+    print(f"    {label}{len(ids)} listing(s)"
+          + (f" of {total}" if total else "") + note)
     return ids, complete
 
 
@@ -1051,39 +1117,6 @@ def card_ages(html):
     return ages
 
 
-def scrape_damaged_ids(url, make, model, store, session, blocks, args):
-    """
-    IDs of this model's listings that the site files under a declared defect.
-
-    Nothing is upserted: these cars are already in the main pass, and counting
-    them twice would bump seen_count and fake a 'seen in two scrapes' duration.
-    Returns None if the search was cut short, so a partial list can never mark
-    the rest of the model clean.
-    """
-    known_models = store.models_for_make(make)
-    search = damaged_url(url)
-    ids = set()
-    total = None
-    for page in range(1, args.max_pages + 1):
-        if STOP.is_set() or blocks.tripped.is_set():
-            return None
-        html = fetch(session, page_url(search, page), blocks=blocks)
-        if not html:
-            return None
-        if page == 1:
-            total = result_count(html)
-            if total == 0:       # an empty search may be padded with suggestions
-                return ids
-        before = len(ids)
-        for row in scrape_page(html):
-            if resolve_model_from_title(row.get("title", ""), make, known_models) == model:
-                ids.add(row["id"])
-        if len(ids) == before or (total is not None and len(ids) >= total):
-            break
-        time.sleep(args.delay)
-    return ids
-
-
 def scrape_model(url, make, model, store, session, blocks, args):
     """Scrape one model; if it hits the pagination cap, split it by price."""
     ids, complete = scrape_search(url, make, model, store, session, blocks, args)
@@ -1106,10 +1139,6 @@ def scrape_model(url, make, model, store, session, blocks, args):
                 queue.insert(0, (lo, mid))
 
     if complete and not STOP.is_set() and not blocks.tripped.is_set():
-        damaged = scrape_damaged_ids(url, make, model, store, session, blocks, args)
-        if damaged is not None:
-            store.mark_damage(make, model, damaged)
-            print(f"    {len(damaged)} listed with a declared defect")
         store.mark_model(url, make, model, len(ids), capped)
     else:
         print(f"    {make}/{model} was cut short — left unmarked so the next "
@@ -1117,23 +1146,38 @@ def scrape_model(url, make, model, store, session, blocks, args):
     return ids
 
 
-def do_refresh_damage(store, session, blocks, args, todo):
-    """Damaged-only searches for already-scraped models, without re-scraping them."""
-    print(f"{len(todo)} model(s) to check for declared defects\n")
-    flagged = 0
-    for i, (url, make, model) in enumerate(todo, start=1):
+def damage_sweep(store, session, blocks, args):
+    """
+    Every car on Autoplius whose seller declared a defect, in one site-wide
+    search: the site's own "Defektai" filter with every defect type ticked
+    (~2,300 cars, ~120 pages). Replaces one damaged search per model.
+    Returns the number of damaged listings in the database, or None if the
+    sweep was cut short (then nothing is changed).
+    """
+    search = damaged_url(f"{DEFAULT_SEARCH}?order_by=3&order_direction=DESC")
+    ids, total = set(), None
+    print("Damage sweep: reading every listing with a declared defect")
+    for page in range(1, args.max_pages + 1):
         if STOP.is_set() or blocks.tripped.is_set():
+            return None
+        html = fetch(session, page_url(search, page), blocks=blocks)
+        if not html:
+            return None
+        if page == 1:
+            total = result_count(html)
+            if total is not None and total > args.max_pages * 20:
+                print(f"  ! {total} damaged listings is more than {args.max_pages} pages "
+                      "can show; the sweep will be partial", file=sys.stderr)
+        before = len(ids)
+        ids.update(row["id"] for row in scrape_page(html))
+        if len(ids) == before or (total is not None and len(ids) >= total):
             break
-        damaged = scrape_damaged_ids(url, make, model, store, session, blocks, args)
-        if damaged is None:
-            print(f"[{i}/{len(todo)}] {make}/{model}: cut short, left unchanged")
-            continue
-        store.mark_damage(make, model, damaged)
-        flagged += len(damaged)
-        if damaged:
-            print(f"[{i}/{len(todo)}] {make}/{model}: {len(damaged)} with a declared defect")
+        if page % 20 == 0:
+            print(f"  page {page}: {len(ids)} of {total or '?'}")
         time.sleep(args.delay)
-    print(f"\nDamaged listings flagged: {flagged}")
+    flagged = store.apply_damage_sweep(ids)
+    print(f"Damage sweep: {len(ids)} damaged on the site, {flagged} of them in the database")
+    return flagged
 
 
 def load_ids_file(path):
@@ -1247,6 +1291,43 @@ def do_prune_gone(store, dry_run):
           f"{remaining} listings remain.")
 
 
+def parse_make_counts(html):
+    """{make key: listings on the site} from the home page's make dropdown."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    counts = {}
+    for option in soup.select(".js-make .js-options .js-option"):
+        name = option.get("data-title", "")
+        if name and not name.startswith("-"):
+            counts[name_slug(name)] = int(option.get("data-badge") or 0)
+    return counts
+
+
+def do_coverage(store, session):
+    """How much of what Autoplius lists right now is in the database, per make.
+    'In the database' means stored and not gone (see find_gone)."""
+    site = parse_make_counts(fetch(session, f"{BASE}/", blocks=BlockDetector()))
+    if not site:
+        print("Could not read the site's make counts.")
+        return None
+    gone = set(find_gone(store))
+    have = {}
+    with store.lock:
+        for ad_id, make in store.conn.execute("SELECT id, make FROM listings"):
+            if ad_id not in gone:
+                have[make] = have.get(make, 0) + 1
+    site_total = sum(site.values())
+    db_total = sum(min(have.get(mk, 0), n) for mk, n in site.items())
+    print(f"Autoplius lists {site_total:,} used cars; the database holds "
+          f"{db_total:,} of them ({db_total / max(site_total, 1):.1%}).\n")
+    gaps = sorted(((n - have.get(mk, 0), mk, n) for mk, n in site.items()), reverse=True)
+    print("Biggest gaps (site / database):")
+    for missing, mk, n in gaps[:15]:
+        if missing <= 0:
+            break
+        print(f"  {mk:<20} {n:6,} / {have.get(mk, 0):6,}   missing {missing:,}")
+    return db_total / max(site_total, 1)
+
+
 def do_status(store):
     total, done, models_total = store.counts()
     print(f"Listings stored : {total}")
@@ -1283,8 +1364,11 @@ def main():
     ap.add_argument("--models", default=None,
                     help='only these, e.g. "bmw/320,audi/a4"')
     ap.add_argument("--refresh-models", action="store_true",
-                    help="re-fetch the make/model list from the sitemap")
+                    help="re-fetch the make/model catalogue from Autoplius "
+                         "(also done automatically once a week)")
     ap.add_argument("--status", action="store_true", help="show progress and exit")
+    ap.add_argument("--coverage", action="store_true",
+                    help="compare the site's per-make counts with the database, then exit")
     ap.add_argument("--prune-gone", action="store_true",
                     help="delete listings not seen in their model's most recent "
                          "scrape (and their price history), then exit")
@@ -1293,7 +1377,7 @@ def main():
     ap.add_argument("--diagnose", action="store_true",
                     help="check what the site will serve this machine, then exit")
     ap.add_argument("--models-file", default=None,
-                    help="text file of 'make/model' lines instead of the sitemap "
+                    help="only the 'make/model' pairs listed in this file "
                          "(example: data/models.txt)")
     ap.add_argument("--export", default=None, help="export listings to CSV and exit")
     ap.add_argument("--block-threshold", type=int, default=CFG["block_threshold"])
@@ -1309,9 +1393,13 @@ def main():
     ap.add_argument("--all-descriptions", action="store_true",
                     help="after scraping, fetch every missing description (one "
                          "request per ad — tens of hours on a full database)")
-    ap.add_argument("--refresh-damage", action="store_true",
-                    help="run only the damaged-only search for each scraped model "
-                         "(or --models), flagging cars with a declared defect")
+    ap.add_argument("--damage-sweep", "--refresh-damage", dest="damage_sweep",
+                    action="store_true",
+                    help="only run the site-wide damaged search and flag those cars")
+    ap.add_argument("--no-damage-sweep", action="store_true",
+                    help="skip the damage sweep that follows a scrape")
+    ap.add_argument("--empty-max-age", type=float, default=CFG["empty_max_age_days"],
+                    help="re-check models that had no listings after this many days")
     args = ap.parse_args()
 
     if args.description_delay < 0:
@@ -1340,6 +1428,8 @@ def main():
         do_diagnose(requests.Session()); store.close(); return
     if args.status:
         do_status(store); store.close(); return
+    if args.coverage:
+        do_coverage(store, requests.Session()); store.close(); return
     if args.export:
         do_export(store, args.export); store.close(); return
     if args.prune_gone:
@@ -1349,47 +1439,43 @@ def main():
     blocks = BlockDetector(threshold=args.block_threshold)
 
     _, _, models_total = store.counts()
-    if args.models_file or args.refresh_models or models_total == 0:
-        if args.models_file:
-            entries = load_models_file(args.models_file)
-            print(f"Model list: {len(entries)} models from {args.models_file}")
-        else:
-            entries = fetch_model_list(session, blocks)
-            if not entries and not blocks.tripped.is_set():
-                entries = fetch_models_from_html(session, blocks, args.delay)
+    with store.lock:
+        missing_ids = store.conn.execute(
+            "SELECT COUNT(*) FROM models WHERE model_id IS NULL").fetchone()[0]
+    age = store.catalogue_age_days()
+    if args.refresh_models or models_total == 0 or missing_ids or age is None or age > 7:
+        entries = fetch_catalogue(session, blocks)
         if not entries:
-            print("\nCould not build a model list.", file=sys.stderr)
+            print("\nCould not read the make/model catalogue.", file=sys.stderr)
             print("Run:  python scripts/autoplius_db.py --diagnose", file=sys.stderr)
-            print("It will tell you whether the whole site is refusing this machine "
-                  "(usually a VPN) or just one path.", file=sys.stderr)
-            store.close(); sys.exit(1)
-        store.save_models(entries)
-        print(f"Model list: {len(entries)} models known\n")
+            if models_total == 0:
+                store.close(); sys.exit(1)
+        else:
+            updated, added = store.sync_catalogue(entries)
+            print(f"Catalogue: {len(entries)} models, {updated} already known, "
+                  f"{added} added\n")
 
-    if args.models:
-        wanted = {m.strip().lower() for m in args.models.split(",") if m.strip()}
-        todo = [(u, mk, md) for (u, mk, md) in store.pending_models(0, True)
-                if f"{mk}/{md}".lower() in wanted]
-    else:
-        todo = store.pending_models(args.max_age, args.force)
-
-    if args.limit is not None:     # 0 legitimately means "discover the model list, scrape nothing"
-        todo = todo[:args.limit]
-
-    if args.refresh_damage:
-        if not args.models:
-            with store.lock:
-                todo = store.conn.execute(
-                    """SELECT url, make, model FROM models
-                       WHERE last_scraped IS NOT NULL ORDER BY make, model""").fetchall()
-            if args.limit is not None:
-                todo = todo[:args.limit]
+    if args.damage_sweep:
         try:
-            do_refresh_damage(store, session, blocks, args, todo)
+            damage_sweep(store, session, blocks, args)
         finally:
             store.close()
             session.close()
         return
+
+    wanted = None
+    if args.models:
+        wanted = {m.strip().lower() for m in args.models.split(",") if m.strip()}
+    if args.models_file:
+        wanted = (wanted or set()) | load_models_file(args.models_file)
+    if wanted is not None:
+        todo = [(u, mk, md) for (u, mk, md) in store.pending_models(0, True)
+                if f"{mk}/{md}".lower() in wanted]
+    else:
+        todo = store.pending_models(args.max_age, args.force, args.empty_max_age)
+
+    if args.limit is not None:     # 0 legitimately means "sync the catalogue, scrape nothing"
+        todo = todo[:args.limit]
 
     if not todo:
         print("Nothing to scrape — everything is up to date. "
@@ -1405,6 +1491,10 @@ def main():
             scrape_model(url, make, model, store, session, blocks, args)
             total, done, mtotal = store.counts()
             print(f"    done — db now holds {total} listings\n")
+            time.sleep(args.delay)       # most models are one page: keep the pace polite
+        if todo and wanted is None and not args.no_damage_sweep \
+                and not STOP.is_set() and not blocks.tripped.is_set():
+            damage_sweep(store, session, blocks, args)
         if args.all_descriptions and not STOP.is_set() and not blocks.tripped.is_set():
             fetch_missing_descriptions(
                 store, session, blocks, args.description_delay,

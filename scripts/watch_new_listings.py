@@ -103,9 +103,7 @@ def iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
-def slug(text):
-    return "-".join(t for t in "".join(
-        ch if ch.isalnum() else " " for ch in (text or "").lower()).split())
+slug = site.name_slug
 
 
 # --------------------------------------------------------------------------- #
