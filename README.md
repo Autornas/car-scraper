@@ -15,18 +15,17 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
 - **Done:** Autoplius full scraper with price history; card details (kW,
   gearbox, body, town, dealer); damage detection (site filter, ad page,
   problem words); description reading for top candidates only; pooled
-  LightGBM price model with p10–p90 ranges; report; local dashboard.
+  LightGBM price model with p10–p90 ranges; report; local dashboard;
+  gap-free 5-minute watcher that prices new ads and checks cheap ones.
 - **Built, not yet run on the data:** full re-scrape for kW / gearbox / body,
   damage sweep, candidate description check.
-- **Broken:** the 5-minute watcher reads the "most relevant" sort (mostly
-  promoted ads) from a fixed 3 pages, so it misses most new ads.
 - **Not started:** autogidas.lt, multi-site database, multi-user website,
   hosting, alerts.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
   tests on saved pages.
-- [ ] **1. Gap-free watcher:** newest-first sort, walk until a whole page is
+- [x] **1. Gap-free watcher:** newest-first sort, walk until a whole page is
   already known, write straight to the database, score new ads, health
   tracking.
 - [ ] **2. Complete Autoplius data:** site-wide damage sweep, full re-scrape,
@@ -73,11 +72,10 @@ python -m pip install -r requirements.txt
 
 - `scripts/autoplius_scraper.py` writes listing data to
   `data/autoplius_cars.csv`.
-- `scripts/watch_new_listings.py` checks the latest result pages every five
-  minutes and appends newly discovered ad IDs to `data/new_listings.csv`.
+- `scripts/watch_new_listings.py` catches every new ad within minutes and
+  writes it straight into `data/autoplius.db` (see "New-listing watcher").
 - `scripts/scraper_dashboard.py` provides a local web interface to start and
   stop the watcher and resumable database scraper, and view price breakdowns.
-- `scripts/live_dashboard.py` is the watcher-only dashboard.
 - `scripts/autoplius_db.py` stores resumable listings in `data/autoplius.db` and
 checks listing titles against the selected make/model before saving, to avoid
 classifying unrelated results under a model when the site returns a broad
@@ -104,8 +102,9 @@ automatically. The dashboard is local to this computer. Keep its terminal
 open; Ctrl+C stops the dashboard and active task. It has three sections:
 
 - **Control**: database numbers (listings, models, damage coverage, kW
-  coverage, descriptions read, candidates waiting, report age), the task list,
-  and the live output of the running task. Tasks: watcher, resume scraping,
+  coverage, descriptions read, candidates waiting, new ads in 24 h, report
+  age), the task list with the watcher's health, the **New deals** list, and
+  the live output of the running task. Tasks: watcher, resume scraping,
   full re-scrape, flag damaged cars, check top candidates (rebuild → read the
   candidate ads → rebuild), and rebuild report. Only one task runs at a time;
   the running task shows in the top bar with a Stop button from any section.
@@ -181,26 +180,40 @@ Older databases are migrated automatically. kW, gearbox and body stay empty
 until a model is scraped again (`autoplius_db.py --force`), and the pooled
 model gets sharper once they are filled.
 
-While the watcher runs, the dashboard also imports new watcher CSV rows when
-their listing URL matches a known make/model; it leaves unmatched rows in the
-CSV instead of guessing their model. It fetches descriptions for newly imported
-watcher listings one at a time with a two-second pause.
-
 To fetch every missing description (slow), run
 `autoplius_db.py --backfill-descriptions` without `--ids-file`. It fetches one ad at a time with a delay, saves progress as it goes, and stops
 if Autoplius refuses a request or presents a browser challenge. No CAPTCHA or
 other access check is bypassed.
 
-The first successful watcher scan establishes a baseline without exporting
-existing listings. Later scans append newly observed IDs to
-`data/new_listings.csv`. “New” means first observed on the watched result
-pages, not a verified upload timestamp. The watcher remembers observed IDs
-and scan history in `data/new_listings_seen.sqlite`.
+## New-listing watcher
 
-To run only the watcher without a dashboard, use
-`.\.venv\Scripts\python.exe scripts\watch_new_listings.py`. To launch the
-scraper dashboard without starting the watcher automatically, add
-`--no-watcher`.
+`scripts/watch_new_listings.py` reads Autoplius' newest-first list
+("Naujausi viršuje") every 5 minutes. Each scan keeps reading pages until a
+whole page holds only ads already in the database, then one more page as a
+margin. A quiet period costs two requests, a busy one reads further, and
+after downtime the next scan walks back to where it left off (up to
+`watcher.max_pages`, about a day of ads; "Resume scraping" fills anything
+older). Raised and promoted ads in the list can't end a scan early, because
+only a fully known page does.
+
+New ads go straight into `data/autoplius.db` with every card field. Ads of
+models missing from the model list are stored too, under a make/model taken
+from the title. Each new ad is priced with the model `autoplius_stats.py`
+saves to `data/price_model/`; a car under the low end of its range has its
+ad opened at once and gets a verdict (deal, damaged, problem, not a real
+price) in the dashboard's **New deals** list. Every scan is recorded, and the
+dashboard shows when scans start failing.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\watch_new_listings.py            # every 5 minutes
+.\.venv\Scripts\python.exe scripts\watch_new_listings.py --once     # one scan
+.\.venv\Scripts\python.exe scripts\watch_new_listings.py --verify 6 # last 6 h all stored?
+```
+
+`--verify HOURS` walks back through the newest-first list and lists any ad
+from that window that is not in the database. Settings live in the
+`[watcher]` section of `config.toml`. To launch the dashboard without starting
+the watcher, add `--no-watcher`.
 
 Build the database and report with:
 

@@ -16,10 +16,10 @@ def test_missing_file_gives_defaults(tmp_path):
 
 
 def test_values_override_defaults(tmp_path):
-    cfg = settings.load(write(tmp_path, "[watcher]\ninterval_minutes = 2\npages = 10\n"))
+    cfg = settings.load(write(tmp_path, "[watcher]\ninterval_minutes = 2\nmax_pages = 10\n"))
     assert cfg["watcher"]["interval_minutes"] == 2.0
     assert isinstance(cfg["watcher"]["interval_minutes"], float)
-    assert cfg["watcher"]["pages"] == 10
+    assert cfg["watcher"]["max_pages"] == 10
     assert cfg["watcher"]["delay"] == settings.DEFAULTS["watcher"]["delay"]
 
 
@@ -30,8 +30,8 @@ def test_unknown_keys_are_ignored(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("text", [
-    '[watcher]\npages = "three"\n',
-    "[watcher]\npages = 2.5\n",
+    '[watcher]\nmax_pages = "three"\n',
+    "[watcher]\nmax_pages = 2.5\n",
     '[report]\npooled = "yes"\n',
     "watcher = 5\n",
     "[paths]\ndatabase = 5\n",

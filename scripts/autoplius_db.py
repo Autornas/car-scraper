@@ -610,7 +610,11 @@ class Store:
 
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        # The watcher, the dashboard and a manual run can all have the file open:
+        # WAL lets readers work during a write, and the timeout makes a writer
+        # wait its turn instead of failing with "database is locked".
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         ensure_description_columns(self.conn)
         self.conn.commit()
@@ -1017,6 +1021,36 @@ def result_count(html):
     return clean_number(m.group(1)) if m else None
 
 
+AGE_UNITS = {"min": 1, "val": 60, "d": 1440, "sav": 10080, "mėn": 43200}
+
+
+def parse_age(text):
+    """Minutes since publishing, from a card's badge: "Prieš 1 val. 15 min." -> 75,
+    "Mažiau nei prieš minutę" -> 0. None for anything else (older ads carry no
+    badge at all)."""
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+    if "mažiau nei" in text:
+        return 0
+    parts = re.findall(r"(\d+)\s*(min|val|d|sav|mėn)\b", text)
+    return sum(int(n) * AGE_UNITS[unit] for n, unit in parts) if parts else None
+
+
+def card_ages(html):
+    """{ad id: minutes since published} for every card on a results page that
+    shows an age badge."""
+    ages = {}
+    for card in BeautifulSoup(html or "", "html.parser").select("a.announcement-item"):
+        m = AD_HREF_RE.search(card.get("href", ""))
+        badge = card.select_one(".badge-new")
+        if m and badge:
+            age = parse_age(badge.get_text(" ", strip=True))
+            if age is not None:
+                ages[m.group(1)] = age
+    return ages
+
+
 def scrape_damaged_ids(url, make, model, store, session, blocks, args):
     """
     IDs of this model's listings that the site files under a declared defect.
@@ -1163,32 +1197,33 @@ def do_export(store, path):
 
 def find_gone(store):
     """
-    A listing is GONE if its model was scraped more recently than the listing
-    was last seen — i.e. the most recent pass over that make/model didn't find
-    it any more. Same definition and same 1-hour buffer as autoplius_stats.py's
-    mark_disappeared(), so "gone" means the same thing everywhere in this
-    project. The buffer keeps a model's own multi-page scrape (which takes a
-    few minutes and gives every page its own timestamp) from marking its own
-    listings gone against each other.
+    A listing is GONE if its model's last full scrape finished more than an
+    hour after the listing was last seen, i.e. that scrape walked the whole
+    model and didn't find it. Same definition as autoplius_stats.py's
+    mark_disappeared(), so "gone" means the same thing everywhere.
+
+    The reference is models.last_scraped, never the newest listing: the watcher
+    inserts single new ads at any time and must not make the rest of a model
+    look sold. The hour of slack covers a long model scrape, whose pages are
+    stamped minutes before the model is marked done.
     """
+    def ts(value):
+        try:
+            return datetime.fromisoformat(value) if value else None
+        except ValueError:
+            return None
+
     with store.lock:
+        scraped = {(mk, md): ts(at) for mk, md, at in store.conn.execute(
+            "SELECT make, model, last_scraped FROM models")}
         rows = store.conn.execute(
             "SELECT id, make, model, last_seen FROM listings").fetchall()
-    latest = {}
-    parsed = []
+    gone = []
     for rid, make, model, last_seen in rows:
-        ts = None
-        if last_seen:
-            try:
-                ts = datetime.fromisoformat(last_seen)
-            except ValueError:
-                ts = None
-        parsed.append((rid, make, model, ts))
-        key = (make, model)
-        if ts and (key not in latest or ts > latest[key]):
-            latest[key] = ts
-    return [rid for rid, make, model, ts in parsed
-            if ts and (latest[(make, model)] - ts).total_seconds() > 3600]
+        seen, ref = ts(last_seen), scraped.get((make, model))
+        if seen and ref and (ref - seen).total_seconds() > 3600:
+            gone.append(rid)
+    return gone
 
 
 def do_prune_gone(store, dry_run):

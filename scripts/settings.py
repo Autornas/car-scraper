@@ -37,8 +37,10 @@ DEFAULTS = {
     },
     "watcher": {
         "interval_minutes": 5.0,
-        "pages": 3,
+        "margin_pages": 1,
+        "max_pages": 50,
         "delay": 1.0,
+        "read_cheap_ads": True,
     },
     "report": {
         "bucket": 3,

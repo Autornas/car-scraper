@@ -91,8 +91,7 @@ def test_damaged_url_ors_every_defect_type():
     assert "10924" not in url            # "Be defektų" must never be included
 
 
-def test_watcher_parser_still_reads_cards(page):
-    # watch_new_listings.py uses the older CSV scraper's parser until phase 1.
+def test_csv_scraper_reads_cards(page):
     rows = list(csv_scraper.scrape_page(page("autoplius/results_bmw_320.html")))
     assert len(rows) == 20
 

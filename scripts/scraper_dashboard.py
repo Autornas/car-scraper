@@ -2,7 +2,6 @@
 """Local web controls for the Autoplius scrapers and price report."""
 
 import argparse
-import csv
 import json
 import os
 import re
@@ -17,15 +16,10 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
-import requests
-from autoplius_db import (
-    BlockDetector,
-    Store,
-    ensure_description_columns,
-    fetch_description,
-)
+from autoplius_db import Store
+from watch_new_listings import health as watcher_health
 
 from settings import SETTINGS, project_path
 
@@ -33,7 +27,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = PROJECT_ROOT / "scripts"
 DATA_DIR = project_path(SETTINGS["paths"]["data_dir"])
 DB_PATH = project_path(SETTINGS["paths"]["database"])
-WATCHER_CSV = DATA_DIR / "new_listings.csv"
 REPORT_PATH = project_path(SETTINGS["paths"]["reports_dir"]) / "report.html"
 REPORT_LOCK = threading.Lock()
 CANDIDATES_PATH = DATA_DIR / "candidates.txt"
@@ -134,7 +127,22 @@ main{flex:1;min-height:0;display:flex}
 .task .d{font-size:12px;color:var(--muted)}
 .task.running{background:color-mix(in srgb,var(--ok) 9%,transparent)}
 .task.running .n::after{content:" · running";color:var(--ok);font-weight:500}
+.right{min-height:0;display:flex;flex-direction:column;gap:12px}
 .log{flex:1;min-height:0;display:flex;flex-direction:column}
+.deals{flex:0 1 auto;max-height:45%;min-height:0;display:flex;flex-direction:column}
+.deals .list{overflow:auto;min-height:0}
+.deal{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:4px 12px;align-items:baseline;
+ padding:8px 14px;border-top:1px solid var(--line);font-size:13px}
+.deal:first-child{border-top:0}
+.deal .t{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deal .m{grid-column:1/-1;font-size:12px;color:var(--muted)}
+.deal .p{font-variant-numeric:tabular-nums;font-weight:650}
+.v{font-size:11px;font-weight:650;padding:1px 7px;border-radius:99px;white-space:nowrap}
+.v.deal{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.v.damaged,.v.problem{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.v.other{background:var(--panel-2);color:var(--muted)}
+.empty{padding:14px;color:var(--muted);font-size:13px}
+.health.bad{color:var(--bad);font-weight:600}.health.ok{color:var(--ok)}
 .log h2 .spacer{flex:1}
 .log label{text-transform:none;letter-spacing:0;font-size:12px;display:flex;align-items:center;gap:5px}
 pre{flex:1;min-height:0;margin:0;padding:10px 14px;overflow:auto;background:var(--log);
@@ -161,6 +169,7 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 #alertClose{position:absolute;top:6px;right:6px;background:none;border:0;font-size:18px;padding:2px 8px}
 @media (max-width:900px){
  body{height:auto;min-height:100%}
+ .deals{max-height:none}
  main{display:block}
  .control{display:flex;flex-direction:column}
  .col{overflow:visible}
@@ -199,7 +208,7 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
     <div class="stat"><div class="v" id="sPower">—</div><div class="l">have kW / gearbox</div></div>
     <div class="stat"><div class="v" id="sDesc">—</div><div class="l">descriptions read</div></div>
     <div class="stat"><div class="v" id="sCand">—</div><div class="l">candidates to read</div></div>
-    <div class="stat"><div class="v" id="sImported">—</div><div class="l">watcher imports</div></div>
+    <div class="stat"><div class="v" id="sNew">—</div><div class="l">new ads, last 24 h</div></div>
     <div class="stat"><div class="v" id="sReport">—</div><div class="l">report built</div></div>
    </div>
   </div>
@@ -207,7 +216,8 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
    <h2>Tasks <span class="spacer"></span><span id="notice" style="text-transform:none;letter-spacing:0"></span></h2>
    <div class="group-label">Live</div>
    <div class="task" data-task="watcher"><div class="t"><div class="n">New-listing watcher</div>
-    <div class="d">Checks the newest 3 result pages every 5 minutes and imports new ads.</div></div>
+    <div class="d">Reads the newest ads every 5 minutes until it reaches ones it already has, prices them and checks cheap ones for defects.</div>
+    <div class="d health" id="watchHealth"></div></div>
     <button data-action="start_watcher">Start</button></div>
    <div class="group-label">Collect</div>
    <div class="task" data-task="database scraper"><div class="t"><div class="n">Resume scraping</div>
@@ -231,10 +241,16 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
   </div>
   <p style="margin:0;font-size:12px;color:var(--muted)">One task runs at a time. Stopping is safe: finished pages are saved and the next run resumes. If Autoplius refuses requests, the refused page opens in your browser — wait before resuming.</p>
  </div>
+ <div class="right">
+ <div class="card deals">
+  <h2>New deals <span class="spacer"></span><span id="dealsNote" style="text-transform:none;letter-spacing:0"></span></h2>
+  <div class="list" id="deals"><div class="empty">Cars the watcher finds under their price range appear here.</div></div>
+ </div>
  <div class="card log">
   <h2><span id="logTitle">Output</span><span class="spacer"></span>
    <label><input type="checkbox" id="follow" checked> Follow output</label></h2>
   <pre id="logs">No task started yet.</pre>
+ </div>
  </div>
 </section>
 
@@ -354,6 +370,36 @@ $("logs").addEventListener("scroll",()=>{
  const p=$("logs");$("follow").checked=p.scrollHeight-p.scrollTop-p.clientHeight<30;
 });
 
+/* ---------- watcher health and deals ---------- */
+const VERDICT={deal:"deal",damaged:"damaged",problem:"problem"};
+function renderWatcher(w,running){
+ const h=$("watchHealth");
+ if(!w||!w.last){h.textContent="Never run yet.";h.className="d health";
+  $("deals").innerHTML='<div class="empty">Cars the watcher finds under their price range appear here.</div>';return;}
+ const l=w.last;
+ if(w.failures){
+  h.textContent=`Failing: last ${w.failures} scan(s) could not read Autoplius · last good scan ${ago(w.last_ok)}`;
+  h.className="d health bad";
+ }else if(running&&w.stale){
+  h.textContent=`No successful scan for ${ago(w.last_ok).replace(" ago","")} — check the output`;h.className="d health bad";
+ }else{
+  h.textContent=`Last scan ${ago(l.started_at)} · ${l.new} new on ${l.pages} page(s)`
+   +(l.hit_cap?" · hit the page cap, older ads may be missing":"");
+  h.className="d health"+(l.hit_cap?" bad":" ok");
+ }
+ const deals=w.deals||[];
+ $("dealsNote").textContent=deals.length?`${deals.filter(d=>d.verdict==="deal").length} deals of ${deals.length} recent`:"";
+ $("deals").innerHTML=deals.length?deals.map(d=>{
+  const under=d.lo?Math.round((d.lo-d.price)/d.lo*100):null;
+  const cls=VERDICT[d.verdict]||"other";
+  return `<div class="deal"><span class="t">${esc(d.title)} ${d.year??""}</span>
+   <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
+   <span class="m">expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
+    d.flags?" · "+esc(d.flags.split("|").join(", ")):""} · ${ago(d.found_at)} ·
+    <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
+ }).join(""):'<div class="empty">No new car under its price range yet.</div>';
+}
+
 const notified=new Set();
 async function refresh(){
  try{
@@ -387,7 +433,9 @@ async function refresh(){
   $("sPower").textContent=db.power_known==null?"—":Math.round(db.power_known/Math.max(1,db.listings)*100)+"%";
   $("sDesc").textContent=fmt(db.descriptions);
   $("sCand").textContent=fmt(db.candidates);
-  $("sImported").textContent=fmt(db.imported);
+  const w=db.watcher;
+  $("sNew").textContent=w?fmt(w.new_24h):"—";
+  renderWatcher(w,running&&task.name==="watcher");
   $("sReport").textContent=ago(db.report_built);
   renderLog(d.logs);
 
@@ -414,15 +462,6 @@ showView(location.hash.slice(1));
 window.addEventListener("hashchange",()=>showView(location.hash.slice(1)));
 loadModels();refresh();setInterval(refresh,2000);
 </script></body></html>"""
-
-
-def _slug(value):
-    return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
-
-
-def _integer(value):
-    digits = re.sub(r"[^\d]", "", str(value or ""))
-    return int(digits) if digits else None
 
 
 def save_database_models(text):
@@ -489,154 +528,6 @@ def save_database_models(text):
     return saved_text, len(entries), message
 
 
-def import_watcher_csv():
-    """Import watcher rows whose URL matches a known database model."""
-    if not WATCHER_CSV.exists() or not DB_PATH.exists():
-        return {"imported": 0, "unmatched": 0}
-
-    connection = sqlite3.connect(DB_PATH, timeout=5)
-    try:
-        tables = {row[0] for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        if not {"listings", "models"}.issubset(tables):
-            return {"imported": 0, "unmatched": 0}
-        ensure_description_columns(connection)
-        model_rows = connection.execute(
-            """SELECT DISTINCT make, model FROM models
-               WHERE make IS NOT NULL AND model IS NOT NULL"""
-        ).fetchall()
-        models = sorted(
-            ((make, model, _slug(f"{make}-{model}")) for make, model in model_rows),
-            key=lambda row: len(row[2]), reverse=True,
-        )
-        if not models:
-            return {"imported": 0, "unmatched": 0}
-
-        connection.execute("""CREATE TABLE IF NOT EXISTS dashboard_imported_ids (
-            id TEXT PRIMARY KEY, imported_at TEXT NOT NULL
-        )""")
-        known = {row[0] for row in connection.execute(
-            "SELECT id FROM dashboard_imported_ids"
-        )}
-        with WATCHER_CSV.open("r", newline="", encoding="utf-8-sig") as file:
-            rows = list(csv.DictReader(file))
-
-        imported = 0
-        unmatched = 0
-        descriptions_to_fetch = []
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for row in rows:
-            ad_id = str(row.get("id") or "").strip()
-            if not ad_id or ad_id in known:
-                continue
-            slug = _slug(Path(unquote(urlparse(row.get("link", "")).path)).stem)
-            title = _slug(row.get("title", ""))
-            match = next(
-                (item for item in models
-                 if slug.startswith(item[2] + "-") or title.startswith(item[2] + "-")
-                 or slug == item[2] or title == item[2]),
-                None,
-            )
-            if match is None:
-                unmatched += 1
-                continue
-            make, model, _ = match
-            year = _integer(row.get("year"))
-            price = _integer(row.get("price_eur"))
-            mileage = _integer(row.get("mileage_km"))
-            existing = connection.execute(
-                """SELECT price_eur, description_checked_at, link
-                   FROM listings WHERE id = ?""", (ad_id,)
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """INSERT INTO listings
-                       (id, make, model, title, year, price_eur, mileage_km,
-                        fuel, engine_l, link, first_seen, last_seen, seen_count)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                    (ad_id, make, model, row.get("title", ""), year, price,
-                     mileage, row.get("fuel", ""), row.get("engine_l", ""),
-                     row.get("link", ""), timestamp, timestamp),
-                )
-                if price is not None:
-                    connection.execute(
-                        "INSERT INTO price_history VALUES (?,?,?)",
-                        (ad_id, timestamp, price),
-                    )
-                descriptions_to_fetch.append((ad_id, row.get("link", "")))
-            else:
-                connection.execute(
-                    """UPDATE listings SET last_seen=?, seen_count=seen_count+1,
-                       year=COALESCE(?,year),
-                       mileage_km=COALESCE(?,mileage_km),
-                       price_eur=COALESCE(?,price_eur)
-                       WHERE id=?""",
-                    (timestamp, year, mileage, price, ad_id),
-                )
-                if price is not None and price != existing[0]:
-                    connection.execute(
-                        "INSERT INTO price_history VALUES (?,?,?)",
-                        (ad_id, timestamp, price),
-                    )
-                if existing[1] is None:
-                    descriptions_to_fetch.append(
-                        (ad_id, row.get("link") or existing[2] or "")
-                    )
-            connection.execute(
-                "INSERT INTO dashboard_imported_ids VALUES (?,?)",
-                (ad_id, timestamp),
-            )
-            known.add(ad_id)
-            imported += 1
-        connection.commit()
-
-        description_checked = 0
-        blocked_url = None
-        blocked_status = None
-        if descriptions_to_fetch:
-            blocks = BlockDetector(threshold=1)
-            with requests.Session() as session:
-                for index, (ad_id, link) in enumerate(descriptions_to_fetch):
-                    if not link:
-                        continue
-                    try:
-                        description, completed, status = fetch_description(
-                            session, link, blocks
-                        )
-                    except ValueError:
-                        connection.execute(
-                            "UPDATE listings SET description_checked_at=? WHERE id=?",
-                            (datetime.now(timezone.utc).isoformat(timespec="seconds"), ad_id),
-                        )
-                        connection.commit()
-                        continue
-                    if not completed:
-                        blocked_url = link
-                        blocked_status = status
-                        break
-                    connection.execute(
-                        """UPDATE listings
-                           SET description=?, description_checked_at=?
-                           WHERE id=?""",
-                        (description, datetime.now(timezone.utc).isoformat(
-                            timespec="seconds"), ad_id),
-                    )
-                    connection.commit()
-                    description_checked += 1
-                    if index + 1 < len(descriptions_to_fetch):
-                        time.sleep(2)
-        return {
-            "imported": imported,
-            "unmatched": unmatched,
-            "description_checked": description_checked,
-            "description_blocked_url": blocked_url,
-            "description_blocked_status": blocked_status,
-        }
-    finally:
-        connection.close()
-
-
 class JobManager:
     def __init__(self):
         self.lock = threading.Lock()
@@ -646,7 +537,6 @@ class JobManager:
         self.started_at = None
         self.finished_at = None
         self.logs = deque(maxlen=400)
-        self.imported = 0
         self.error = None
         self.exit_code = None
         self.stop_requested = False
@@ -731,48 +621,14 @@ class JobManager:
         ).start()
         return True, f"Started {name}."
 
-    def log_watcher_import(self, result):
-        if result["imported"]:
-            self.imported += result["imported"]
-            self.append_log(
-                f"Imported {result['imported']} watcher listing(s) "
-                "into the price database.\n"
-            )
-        if result.get("description_checked"):
-            self.append_log(
-                f"Fetched {result['description_checked']} new seller description(s).\n"
-            )
-        blocked_url = result.get("description_blocked_url")
-        if blocked_url:
-            status = result.get("description_blocked_status")
-            message = (
-                f"verification challenge for {blocked_url}\n"
-                if status == 200
-                else f"HTTP {status} for {blocked_url}\n"
-                if status is not None
-                else f"Description request failed for {blocked_url}\n"
-            )
-            self.append_log(message)
-            self.open_refused_page(message)
-
     def _pump(self, process, name):
         for line in process.stdout:
             self.append_log(line)
             self.open_refused_page(line)
-            if name == "watcher":
-                try:
-                    result = import_watcher_csv()
-                except (OSError, sqlite3.Error) as exc:
-                    self.append_log(f"Database import failed: {exc}\n")
-                else:
-                    self.log_watcher_import(result)
         return process.wait()
 
     def _collect_output(self, process, name, rest=()):
         try:
-            if name == "watcher":
-                result = import_watcher_csv()
-                self.log_watcher_import(result)
             return_code = self._pump(process, name)
             # Multi-step tasks: each step runs only if the previous one succeeded
             # and nobody pressed Stop.
@@ -838,12 +694,12 @@ class JobManager:
                     "exit_code": self.exit_code,
                     "challenge_url": self.challenge_url,
                 }
-            return task, list(self.logs), self.imported
+            return task, list(self.logs)
 
 
-def database_summary(imported_total):
+def database_summary():
     result = {"listings": 0, "models_done": 0, "models_total": 0,
-              "imported": imported_total, "last_scraped": None,
+              "watcher": None, "last_scraped": None,
               "damaged": None, "damage_checked": None, "power_known": None,
               "descriptions": None, "candidates": None, "report_built": None}
     if REPORT_PATH.exists():
@@ -877,10 +733,8 @@ def database_summary(imported_total):
                 connection.execute(
                     """SELECT COUNT(*), COUNT(last_scraped), MAX(last_scraped) FROM models"""
                 ).fetchone()
-        if "dashboard_imported_ids" in tables:
-            result["imported"] = connection.execute(
-                "SELECT COUNT(*) FROM dashboard_imported_ids"
-            ).fetchone()[0]
+        if "watch_scans" in tables:
+            result["watcher"] = watcher_health(connection)
     finally:
         connection.close()
     return result
@@ -908,11 +762,11 @@ def make_handler(manager):
                 self.end_headers()
                 self.wfile.write(body)
             elif route == "/api/status":
-                task, logs, imported = manager.snapshot()
+                task, logs = manager.snapshot()
                 self._send_json(200, {
                     "task": task,
                     "logs": logs[-150:],
-                    "database": database_summary(imported),
+                    "database": database_summary(),
                     "report_exists": REPORT_PATH.exists(),
                 })
             elif route == "/api/models":

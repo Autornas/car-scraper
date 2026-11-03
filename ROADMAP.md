@@ -115,6 +115,7 @@ Each phase ends in something that works on its own. Sizes: **S** = an
 evening, **M** = a day or two, **L** = several days.
 
 ### Phase 0 — Clean foundation (S)
+**Status: done 2026-11-03.**
 1. `git init`, first commit. Move old root scripts, database backups and
    `autoplius_old.db` into `archive/` (kept out of git).
 2. One `config.toml`: data paths, delays, watcher interval, site switches.
@@ -125,6 +126,8 @@ evening, **M** = a day or two, **L** = several days.
 **Done when:** tests pass, and the repo contains only current code.
 
 ### Phase 1 — Gap-free 5-minute watcher (M) ← biggest immediate win
+**Status: done 2026-11-03.** All six points below are in
+`scripts/watch_new_listings.py`; `--verify HOURS` is the completeness check.
 1. Use the newest-first sort.
 2. Walk pages until **a whole page is already known**, then one more page as
    a safety margin. Promoted ads that reappear never count as the stop

@@ -19,9 +19,11 @@ block_threshold = 8      # consecutive refusals before a run stops
 enabled = false          # collector arrives in phase 4
 
 [watcher]
-interval_minutes = 5
-pages = 3
-delay = 1.0
+interval_minutes = 5     # time between scan starts
+margin_pages = 1         # extra pages read after the first all-known page
+max_pages = 50           # safety cap per scan (~1,000 ads, roughly a day)
+delay = 1.0              # seconds between page requests
+read_cheap_ads = true    # open the ad of every new car under its p10 to check for defects
 
 [report]
 bucket = 3               # year-band width inside a generation

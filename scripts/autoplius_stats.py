@@ -314,19 +314,33 @@ def _float(value):
         return float("nan")
 
 
-def pooled_features(cars):
+def gen_key(c):
+    """Generation if known, otherwise the year band the report grouped it in."""
+    return f"{c['make']}|{c['model']}|{c.get('gen') or c.get('band')}"
+
+
+def pooled_features(cars, codes=None):
+    """
+    Feature matrix for the pooled model. `codes` maps each categorical feature's
+    values to integers. Training builds it from the cars; scoring new ads must
+    pass the training's codes back in, or "BMW" would mean a different number.
+    Returns (X, names, codes).
+    """
     import numpy as np
     raw = {
         "make_model": [f"{c['make']}|{c['model']}" for c in cars],
-        "gen_key": [f"{c['make']}|{c['model']}|{c['gen'] or c['band']}" for c in cars],
+        "gen_key": [c.get("gen_key") or gen_key(c) for c in cars],
         "fuel": [c["fuel"] or None for c in cars],
         "gearbox": [c.get("gearbox") or None for c in cars],
         "body": [c.get("body") or None for c in cars],
     }
+    if codes is None:
+        codes = {name: {v: i for i, v in enumerate(sorted({v for v in raw[name] if v}))}
+                 for name in POOLED_CATEGORICAL}
     cols, names = [], []
     for name in POOLED_CATEGORICAL:
-        codes = {v: i for i, v in enumerate(sorted({v for v in raw[name] if v}))}
-        cols.append([codes[v] if v in codes else float("nan") for v in raw[name]])
+        cols.append([codes[name].get(v, float("nan")) if v else float("nan")
+                     for v in raw[name]])
         names.append(name)
     numeric = {
         "year": [c["year"] for c in cars],
@@ -335,24 +349,35 @@ def pooled_features(cars):
         "kw": [c.get("power_kw") or float("nan") for c in cars],
         "dealer": [c.get("dealer") if c.get("dealer") is not None else float("nan")
                    for c in cars],
-        "damaged": [1 if c["suspect_declared"] else
+        "damaged": [1 if c.get("suspect_declared") else
                     (0 if c.get("damaged") == 0 else float("nan")) for c in cars],
     }
     for name in POOLED_NUMERIC:
         cols.append(numeric[name])
         names.append(name)
-    return np.array(cols, dtype=float).T, names
+    return np.array(cols, dtype=float).T, names, codes
 
 
-def fit_pooled(cars, folds=5, seed=7):
+POOLED_PARAMS = dict(objective="quantile", learning_rate=0.05, num_leaves=63,
+                     min_data_in_leaf=15, bagging_fraction=0.8, bagging_freq=1,
+                     feature_fraction=0.9, cat_smooth=10, min_data_per_group=20,
+                     deterministic=True, verbose=-1)
+POOLED_ROUNDS = 500
+
+
+def fit_pooled(cars, folds=5, seed=7, save_dir=None):
     """Out-of-fold p10 / p50 / p90 for every car. Returns a summary dict, or None
-    when lightgbm is not installed (the per-group baselines are used instead)."""
+    when lightgbm is not installed (the per-group baselines are used instead).
+
+    With `save_dir`, also fits the same three quantiles on ALL cars and saves
+    them there (see PriceModel), so the watcher can price a new ad the moment
+    it appears without refitting anything."""
     try:
         import lightgbm as lgb
         import numpy as np
     except ImportError:
         return None
-    X, names = pooled_features(cars)
+    X, names, codes = pooled_features(cars)
     y = np.log(np.array([c["price_eur"] for c in cars], dtype=float))
     # Group price outliers (parts cars, typos, lease figures) don't teach the
     # model anything about what a car is worth; they are still priced below.
@@ -360,25 +385,24 @@ def fit_pooled(cars, folds=5, seed=7):
     # Fold by a stable hash of the id, so a rerun on unchanged data is identical.
     fold = np.array([int(c["id"]) % folds if str(c["id"]).isdigit()
                      else hash(c["id"]) % folds for c in cars])
-    params = dict(objective="quantile", learning_rate=0.05, num_leaves=63,
-                  min_data_in_leaf=15, bagging_fraction=0.8, bagging_freq=1,
-                  feature_fraction=0.9, cat_smooth=10, min_data_per_group=20,
-                  seed=seed, deterministic=True, verbose=-1)
+    params = {**POOLED_PARAMS, "seed": seed}
     cat_idx = [names.index(n) for n in POOLED_CATEGORICAL]
     pred = np.full((len(cars), len(POOLED_QUANTILES)), np.nan)
     for f in range(folds):
         tr, te = (fold != f) & train_ok, fold == f
         data = lgb.Dataset(X[tr], y[tr], categorical_feature=cat_idx, free_raw_data=False)
         for qi, q in enumerate(POOLED_QUANTILES):
-            model = lgb.train({**params, "alpha": q}, data, num_boost_round=500)
+            model = lgb.train({**params, "alpha": q}, data, num_boost_round=POOLED_ROUNDS)
             pred[te, qi] = model.predict(X[te])
     pred.sort(axis=1)                     # quantile crossing: keep lo <= mid <= hi
     clean = train_ok & np.array([not c["suspect"] for c in cars])
     # Quantile trees under-cover on unseen cars (~72% inside p10-p90, not 80%).
     # Shift each bound by the out-of-fold miss at its own quantile, so that on
     # clean cars exactly 10% really sit under "lo" and 10% over "hi".
-    pred[:, 0] += np.quantile((y - pred[:, 0])[clean], POOLED_QUANTILES[0])
-    pred[:, 2] += np.quantile((y - pred[:, 2])[clean], POOLED_QUANTILES[2])
+    shift_lo = float(np.quantile((y - pred[:, 0])[clean], POOLED_QUANTILES[0]))
+    shift_hi = float(np.quantile((y - pred[:, 2])[clean], POOLED_QUANTILES[2]))
+    pred[:, 0] += shift_lo
+    pred[:, 2] += shift_hi
     lo, mid, hi = np.exp(pred[:, 0]), np.exp(pred[:, 1]), np.exp(pred[:, 2])
     lo, hi = np.minimum(lo, mid), np.maximum(hi, mid)
     for c, a, b, d in zip(cars, lo, mid, hi):
@@ -392,13 +416,87 @@ def fit_pooled(cars, folds=5, seed=7):
     price = np.exp(y)
     err = np.abs(mid - price) / price
     inside = (price >= lo) & (price <= hi)
-    return {
+    summary = {
         "n": len(cars), "folds": folds,
         "err": round(float(np.median(err[clean])) * 100, 1),
         "coverage": round(float(inside[clean].mean()) * 100, 1),
         "features": list(names),
         "filled": {n: int(np.isfinite(X[:, i]).sum()) for i, n in enumerate(names)},
     }
+
+    if save_dir is not None:
+        full = lgb.Dataset(X[train_ok], y[train_ok], categorical_feature=cat_idx,
+                           free_raw_data=False)
+        boosters = [lgb.train({**params, "alpha": q}, full, num_boost_round=POOLED_ROUNDS)
+                    for q in POOLED_QUANTILES]
+        # A new ad has no report band yet; it gets the key its make/model/year
+        # was trained under.
+        year_keys = {f"{c['make']}|{c['model']}|{c['year']}": gen_key(c) for c in cars}
+        PriceModel(boosters, codes, shift_lo, shift_hi, year_keys,
+                   {"trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "n": int(train_ok.sum()), "err": summary["err"]}).save(save_dir)
+        summary["saved"] = str(save_dir)
+    return summary
+
+
+class PriceModel:
+    """
+    The pooled model fitted on every car, saved to disk by autoplius_stats.py:
+
+        data/price_model/q10.txt, q50.txt, q90.txt   LightGBM boosters
+        data/price_model/meta.json                   category codes, range
+                                                     calibration, year -> key
+
+        model = PriceModel.load(DATA_DIR / "price_model")    # None if absent
+        lo, mid, hi = model.price(car)                        # car = listing dict
+    """
+    FILES = ("q10.txt", "q50.txt", "q90.txt")
+
+    def __init__(self, boosters, codes, shift_lo, shift_hi, year_keys, info):
+        self.boosters, self.codes = boosters, codes
+        self.shift_lo, self.shift_hi = shift_lo, shift_hi
+        self.year_keys, self.info = year_keys, info
+
+    def save(self, directory):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        for booster, name in zip(self.boosters, self.FILES):
+            booster.save_model(str(directory / name))
+        (directory / "meta.json").write_text(json.dumps({
+            "codes": self.codes, "shift_lo": self.shift_lo, "shift_hi": self.shift_hi,
+            "year_keys": self.year_keys, "info": self.info,
+            "quantiles": list(POOLED_QUANTILES)}), encoding="utf-8")
+
+    @classmethod
+    def load(cls, directory):
+        directory = Path(directory)
+        try:
+            import lightgbm as lgb
+            meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+            boosters = [lgb.Booster(model_file=str(directory / n)) for n in cls.FILES]
+        except (ImportError, OSError, ValueError):
+            return None
+        return cls(boosters, meta["codes"], meta["shift_lo"], meta["shift_hi"],
+                   meta["year_keys"], meta.get("info", {}))
+
+    def knows(self, car):
+        """Whether this make/model was in the training data. For one that wasn't,
+        the price is a guess from unrelated cars and must not drive a verdict."""
+        return f"{car['make']}|{car['model']}" in self.codes["make_model"]
+
+    def price(self, car):
+        """(lo, mid, hi) in EUR for one listing dict, or None without a year."""
+        import numpy as np
+        if not car.get("year"):
+            return None
+        car = dict(car)
+        car.setdefault("gen_key", self.year_keys.get(
+            f"{car['make']}|{car['model']}|{car['year']}"))
+        X, _, _ = pooled_features([car], self.codes)
+        lo, mid, hi = sorted(float(b.predict(X)[0]) for b in self.boosters)
+        lo, mid, hi = (float(np.exp(lo + self.shift_lo)), float(np.exp(mid)),
+                       float(np.exp(hi + self.shift_hi)))
+        return min(lo, mid), mid, max(hi, mid)
 
 
 def spark(prices, bins=12):
@@ -599,22 +697,33 @@ def assign_groups(cars, bucket, min_n):
     return cars
 
 
-def mark_disappeared(cars):
+def model_scrape_times(db_path):
+    """(make, model) -> when its last FULL scrape finished (models.last_scraped)."""
+    con = sqlite3.connect(db_path)
+    try:
+        return {(mk, md): parse_ts(ts) for mk, md, ts in
+                con.execute("SELECT make, model, last_scraped FROM models")}
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+
+
+def mark_disappeared(cars, scraped):
     """
-    A listing is treated as gone (sold or withdrawn) if its model was scraped
-    more recently than this listing was last seen. Reference point is per-model,
-    so scraping only some models doesn't wrongly mark the rest as sold.
+    A listing is treated as gone (sold or withdrawn) if its model's last full
+    scrape finished more than an hour after the listing was last seen, i.e.
+    that scrape walked the whole model and didn't find it.
+
+    The reference is the full scrape (`scraped`, from the models table), never
+    the newest listing: the watcher inserts single new ads at any time, and one
+    fresh BMW 320 must not make every other BMW 320 look sold. Models only the
+    watcher has seen have no full scrape, so nothing in them is marked gone.
     """
-    latest = {}
-    for c in cars:
-        ts = parse_ts(c["last_seen"])
-        key = (c["make"], c["model"])
-        if ts and (latest.get(key) is None or ts > latest[key]):
-            latest[key] = ts
     for c in cars:
         seen = parse_ts(c["last_seen"])
         first = parse_ts(c["first_seen"])
-        ref = latest.get((c["make"], c["model"]))
+        ref = scraped.get((c["make"], c["model"]))
         c["gone"] = bool(seen and ref and (ref - seen).total_seconds() > 3600)
         # A listing seen in only ONE scrape carries no duration information:
         # first_seen == last_seen, so the difference is 0 however long it was
@@ -1458,7 +1567,7 @@ def main():
     if not cars:
         sys.exit("No usable listings — scrape some data first.")
     cars = assign_groups(cars, bucket, min_n)
-    cars = mark_disappeared(cars)
+    cars = mark_disappeared(cars, model_scrape_times(args.db))
     groups = build_groups(cars, min_n)
     series = model_series(cars, max(3, min_n))
     sold = sold_summary(cars, groups)
@@ -1467,7 +1576,7 @@ def main():
     if not args.no_pooled:
         print(f"Fitting the pooled price model on {len(cars):,} cars "
               f"({len(POOLED_QUANTILES)} quantiles x 5 folds)...")
-        pooled = fit_pooled(cars)
+        pooled = fit_pooled(cars, save_dir=DATA_DIR / "price_model")
         if pooled is None:
             print("  lightgbm is not installed - using per-group baselines. "
                   "pip install lightgbm numpy", file=sys.stderr)
@@ -1575,6 +1684,8 @@ def main():
         print(f"Pooled model: ±{pooled['err']}% median error out of fold, "
               f"{pooled['coverage']}% of clean cars inside their p10-p90 range "
               f"(80% expected)")
+        if pooled.get("saved"):
+            print(f"  saved for scoring new ads: {pooled['saved']}")
         print("  feature coverage: " + ", ".join(
             f"{k} {v / pooled['n']:.0%}" for k, v in pooled["filled"].items()))
     print(f"{m['suspect']:,} cars flagged ({m['declared']:,} declared defects; "
