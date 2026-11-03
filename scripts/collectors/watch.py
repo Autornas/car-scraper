@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from collectors.common import DATA_DIR, BlockDetector, fetch, name_slug, normalized_label
+from collectors.dupes import same_car_elsewhere
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS watch_scans (
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS new_deals (
     verdict  TEXT,          -- deal / damaged / problem / not a real price / unchecked
     flags    TEXT,
     link     TEXT,
+    also     TEXT,          -- the same car on another site: "site|price|link"
     PRIMARY KEY (source, id)
 );
 CREATE INDEX IF NOT EXISTS idx_new_deals_found ON new_deals(found_at);
@@ -232,6 +234,9 @@ class WatchStore:
         self.db = store.site(source)
         with store.lock:
             store.conn.executescript(SCHEMA)
+            cols = {r[1] for r in store.conn.execute("PRAGMA table_info(new_deals)")}
+            if "also" not in cols:                   # tables from before Phase 5
+                store.conn.execute("ALTER TABLE new_deals ADD COLUMN also TEXT")
             store.conn.commit()
 
     def model_pairs(self):
@@ -266,15 +271,23 @@ class WatchStore:
                  int(result["reached_known"]), int(result["hit_cap"]), oldest, message))
             self.store.conn.commit()
 
-    def record_deal(self, row, make, model, found, lo, mid, hi, verdict_, flags):
+    def record_deal(self, row, make, model, found, lo, mid, hi, verdict_, flags, also=None):
+        also_text = f"{also['source']}|{also['price_eur']}|{also['link']}" if also else None
         with self.store.lock:
             self.store.conn.execute(
-                """INSERT OR REPLACE INTO new_deals VALUES
-                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT OR REPLACE INTO new_deals
+                   (source, id, found_at, make, model, title, year, mileage_km, price,
+                    lo, mid, hi, verdict, flags, link, also)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.source, row["id"], iso(found), make, model, row["title"],
                  row["year"] or None, row["mileage_km"] or None, row["price_eur"],
-                 round(lo), round(mid), round(hi), verdict_, "|".join(flags), row["link"]))
+                 round(lo), round(mid), round(hi), verdict_, "|".join(flags), row["link"],
+                 also_text))
             self.store.conn.commit()
+
+    def same_car_elsewhere(self, car):
+        with self.store.lock:
+            return same_car_elsewhere(self.store.conn, self.source, car)
 
 
 def health(conn, source, stale_minutes=15):
@@ -301,7 +314,7 @@ def health(conn, source, stale_minutes=15):
             (source, day_ago)).fetchone()[0]
         deals = conn.execute(
             """SELECT id, found_at, make, model, title, year, mileage_km, price, lo, mid,
-                      verdict, flags, link FROM new_deals
+                      verdict, flags, link, also FROM new_deals
                WHERE source = ? ORDER BY found_at DESC LIMIT 30""", (source,)).fetchall()
     except Exception:          # tables not created yet: the watcher never ran
         return None
@@ -310,7 +323,7 @@ def health(conn, source, stale_minutes=15):
         age = (now_utc() - datetime.fromisoformat(last_ok)).total_seconds() / 60
         stale = age > stale_minutes
     keys = ("id", "found_at", "make", "model", "title", "year", "km", "price", "lo",
-            "mid", "verdict", "flags", "link")
+            "mid", "verdict", "flags", "link", "also")
     deals = [{**dict(zip(keys, d)), "source": source} for d in deals]
     return {
         "last": dict(zip(("started_at", "status", "pages", "new", "reached_known",
@@ -395,11 +408,12 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
         if row["price_eur"] == "" or not row["year"]:
             continue
         make, model_name = watch.db.canonical(row["_make"], row["_model"])
-        car = {"make": make, "model": model_name, "year": row["year"],
+        car = {"source": site.SOURCE, "make": make, "model": model_name, "year": row["year"],
                "mileage_km": row["mileage_km"] or None, "fuel": row["fuel"],
                "engine_l": row["engine_l"], "power_kw": row["power_kw"],
                "gearbox": row["gearbox"], "body": row["body"], "dealer": row["dealer"],
-               "gen": generation_for(make, model_name, row["year"], compiled)}
+               "gen": generation_for(make, model_name, row["year"], compiled),
+               "price_eur": row["price_eur"], "location": row["location"]}
         if not model.knows(car):          # never trained on this model: no verdict
             continue
         lo, mid, hi = model.price(car)
@@ -414,9 +428,12 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
             if read:
                 watch.db.save_description(row["id"], description, details)
         v, flags = verdict(row["price_eur"], lo, mid, details, row["title"], description, read)
-        watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags)
+        also = watch.same_car_elsewhere(car)
+        watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags, also)
         print(f"  {v.upper():<16} {row['title']} {row['year']} €{row['price_eur']:,} "
-              f"(expected €{mid:,.0f}, low end €{lo:,.0f}) {row['link']}", flush=True)
+              f"(expected €{mid:,.0f}, low end €{lo:,.0f}) {row['link']}"
+              + (f"  [also on {also['source']} €{also['price_eur']:,}]" if also else ""),
+              flush=True)
     return cheap
 
 

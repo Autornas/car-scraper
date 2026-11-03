@@ -43,6 +43,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from collectors.dupes import find_duplicates, save_duplicates
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
@@ -303,7 +304,10 @@ def text_flags(*texts):
 # Every car is priced OUT OF FOLD — by a model that never saw it. Trees fitted
 # on a car will happily memorise its price, and then nothing looks cheap.
 POOLED_QUANTILES = (0.1, 0.5, 0.9)
-POOLED_CATEGORICAL = ("make_model", "gen_key", "fuel", "gearbox", "body")
+POOLED_CATEGORICAL = ("make_model", "gen_key", "fuel", "gearbox", "body", "source")
+# What models saved before `source` existed were trained on.
+LEGACY_FEATURES = ("make_model", "gen_key", "fuel", "gearbox", "body",
+                   "year", "km", "engine", "kw", "dealer", "damaged")
 POOLED_NUMERIC = ("year", "km", "engine", "kw", "dealer", "damaged")
 IMPLAUSIBLE_SHARE = 0.3
 
@@ -320,12 +324,13 @@ def gen_key(c):
     return f"{c['make']}|{c['model']}|{c.get('gen') or c.get('band')}"
 
 
-def pooled_features(cars, codes=None):
+def pooled_features(cars, codes=None, features=None):
     """
     Feature matrix for the pooled model. `codes` maps each categorical feature's
     values to integers. Training builds it from the cars; scoring new ads must
     pass the training's codes back in, or "BMW" would mean a different number.
-    Returns (X, names, codes).
+    `features` picks and orders the columns: a saved model must be fed exactly
+    the columns it was trained on. Returns (X, names, codes).
     """
     import numpy as np
     raw = {
@@ -334,15 +339,15 @@ def pooled_features(cars, codes=None):
         "fuel": [c["fuel"] or None for c in cars],
         "gearbox": [c.get("gearbox") or None for c in cars],
         "body": [c.get("body") or None for c in cars],
+        "source": [c.get("source") or None for c in cars],
     }
     if codes is None:
         codes = {name: {v: i for i, v in enumerate(sorted({v for v in raw[name] if v}))}
                  for name in POOLED_CATEGORICAL}
-    cols, names = [], []
+    columns = {}
     for name in POOLED_CATEGORICAL:
-        cols.append([codes[name].get(v, float("nan")) if v else float("nan")
-                     for v in raw[name]])
-        names.append(name)
+        known = codes.get(name, {})
+        columns[name] = [known.get(v, float("nan")) if v else float("nan") for v in raw[name]]
     numeric = {
         "year": [c["year"] for c in cars],
         "km": [c["mileage_km"] if c["mileage_km"] else float("nan") for c in cars],
@@ -353,10 +358,9 @@ def pooled_features(cars, codes=None):
         "damaged": [1 if c.get("suspect_declared") else
                     (0 if c.get("damaged") == 0 else float("nan")) for c in cars],
     }
-    for name in POOLED_NUMERIC:
-        cols.append(numeric[name])
-        names.append(name)
-    return np.array(cols, dtype=float).T, names, codes
+    columns.update(numeric)
+    names = list(features or (*POOLED_CATEGORICAL, *POOLED_NUMERIC))
+    return np.array([columns[n] for n in names], dtype=float).T, names, codes
 
 
 POOLED_PARAMS = dict(objective="quantile", learning_rate=0.05, num_leaves=63,
@@ -383,6 +387,8 @@ def fit_pooled(cars, folds=5, seed=7, save_dir=None):
     # Group price outliers (parts cars, typos, lease figures) don't teach the
     # model anything about what a car is worth; they are still priced below.
     train_ok = np.array([not c.get("price_outlier") for c in cars])
+    # (Duplicates of a car on another site never get here: merge_duplicates
+    # removed them, so each car is learned from once.)
     # Fold by a stable hash of the id, so a rerun on unchanged data is identical.
     fold = np.array([int(c["id"]) % folds if str(c["id"]).isdigit()
                      else hash(c["id"]) % folds for c in cars])
@@ -435,7 +441,7 @@ def fit_pooled(cars, folds=5, seed=7, save_dir=None):
         year_keys = {f"{c['make']}|{c['model']}|{c['year']}": gen_key(c) for c in cars}
         PriceModel(boosters, codes, shift_lo, shift_hi, year_keys,
                    {"trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "n": int(train_ok.sum()), "err": summary["err"]}).save(save_dir)
+                    "n": int(train_ok.sum()), "err": summary["err"]}, names).save(save_dir)
         summary["saved"] = str(save_dir)
     return summary
 
@@ -453,8 +459,9 @@ class PriceModel:
     """
     FILES = ("q10.txt", "q50.txt", "q90.txt")
 
-    def __init__(self, boosters, codes, shift_lo, shift_hi, year_keys, info):
+    def __init__(self, boosters, codes, shift_lo, shift_hi, year_keys, info, features=None):
         self.boosters, self.codes = boosters, codes
+        self.features = list(features or LEGACY_FEATURES)
         self.shift_lo, self.shift_hi = shift_lo, shift_hi
         self.year_keys, self.info = year_keys, info
 
@@ -465,7 +472,7 @@ class PriceModel:
             booster.save_model(str(directory / name))
         (directory / "meta.json").write_text(json.dumps({
             "codes": self.codes, "shift_lo": self.shift_lo, "shift_hi": self.shift_hi,
-            "year_keys": self.year_keys, "info": self.info,
+            "year_keys": self.year_keys, "info": self.info, "features": self.features,
             "quantiles": list(POOLED_QUANTILES)}), encoding="utf-8")
 
     @classmethod
@@ -478,7 +485,7 @@ class PriceModel:
         except (ImportError, OSError, ValueError):
             return None
         return cls(boosters, meta["codes"], meta["shift_lo"], meta["shift_hi"],
-                   meta["year_keys"], meta.get("info", {}))
+                   meta["year_keys"], meta.get("info", {}), meta.get("features"))
 
     def knows(self, car):
         """Whether this make/model was in the training data. For one that wasn't,
@@ -493,7 +500,7 @@ class PriceModel:
         car = dict(car)
         car.setdefault("gen_key", self.year_keys.get(
             f"{car['make']}|{car['model']}|{car['year']}"))
-        X, _, _ = pooled_features([car], self.codes)
+        X, _, _ = pooled_features([car], self.codes, self.features)
         lo, mid, hi = sorted(float(b.predict(X)[0]) for b in self.boosters)
         lo, mid, hi = (float(np.exp(lo + self.shift_lo)), float(np.exp(mid)),
                        float(np.exp(hi + self.shift_hi)))
@@ -743,6 +750,28 @@ def mark_disappeared(cars, scraped):
         c["days"] = round((seen - first).total_seconds() / 86400, 1) \
             if (seen and first and (c["seen_count"] or 0) >= 2) else None
     return cars
+
+
+def merge_duplicates(cars, db_path):
+    """
+    The same car listed on two sites becomes one row: the cheaper listing
+    stays (with the other attached as c["also"]), the other leaves the
+    analysis, so it is neither counted twice in medians and the price model
+    nor shown as a second "deal". Only listings still up are matched. The
+    pairs are saved to the `duplicates` table for the dashboard and watcher.
+    Returns (cars, number of pairs).
+    """
+    pairs = find_duplicates([c for c in cars if not c["gone"]])
+    con = sqlite3.connect(db_path)
+    try:
+        save_duplicates(con, pairs)
+    finally:
+        con.close()
+    hidden = set()
+    for shown, other, _ in pairs:
+        shown.setdefault("also", []).append(other)
+        hidden.add(id(other))
+    return [c for c in cars if id(c) not in hidden], len(pairs)
 
 
 def build_groups(cars, min_n):
@@ -1106,6 +1135,7 @@ const detailRow = (c, cols) => {
     ["Mileage", c[C.km]==null ? "" : num(c[C.km])+" km"], ["Body", c[C.body]],
     ["First price", c[C.first] && c[C.first]!==c[C.price] ? eur(c[C.first]) : ""],
     ["Days listed", c[C.days]], ["Flags", (c[C.flags]||"").split("|").join(", ")],
+    ["Also listed", alsoList(c).map(o => `${o.src} ${o.price ? eur(o.price) : ""}`).join(", ")],
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
     d ? `<div class="desc">${esc(d)}</div>`
@@ -1153,7 +1183,9 @@ const basisTitle = g => g.fit
     + `too few cars with mileage, or the model lost to the median in cross-validation.`;
 
 document.getElementById("sub").textContent =
-  `${DATA.meta.cars.toLocaleString()} priced listings · ${DATA.meta.groups} groups of `
+  `${DATA.meta.cars.toLocaleString()} priced cars`
+  + (DATA.meta.duplicates ? ` (${DATA.meta.duplicates.toLocaleString()} listed on two sites, counted once)` : "")
+  + ` · ${DATA.meta.groups} groups of `
   + `${DATA.meta.min_n}+ cars · ${DATA.meta.gen_groups} grouped by generation · `
   + `${DATA.meta.skipped_total} listings skipped · generated ${DATA.meta.generated}`;
 document.getElementById("tiles").innerHTML=[
@@ -1221,6 +1253,13 @@ document.getElementById("siteSel").innerHTML='<option value="">Any site</option>
 document.getElementById("siteSel").hidden = SITES.length < 2;
 /* Which site a car is from, shown only once there is more than one. */
 const sitePill = c => SITES.length > 1 ? `<span class="pill">${esc(c[C.src])}</span>` : "";
+/* The same car on another site: a link with that site's price. */
+const alsoList = c => !c[C.also] ? [] : c[C.also].split("~").map(x => {
+  const [src, price, link] = x.split("|"); return {src, price: +price || null, link}; });
+const alsoPill = c => alsoList(c).map(o =>
+  `<a class="pill" href="${esc(o.link)}" target="_blank" rel="noopener"
+     title="the same car listed on ${esc(o.src)}">also on ${esc(o.src)} ${o.price ? eur(o.price) : ""} ↗</a>`
+  ).join("");
 const fuels=[...new Set(DATA.cars.map(c=>c[C.fuel]).filter(Boolean))].sort();
 const gears=[...new Set(DATA.cars.map(c=>c[C.gear]).filter(Boolean))].sort();
 document.getElementById("gearSel").innerHTML='<option value="">Any gearbox</option>'
@@ -1358,7 +1397,7 @@ function drawDrill(){
    <th class="num" data-k="km">km</th><th></th>
    </tr></thead><tbody></tbody></table></div>`;
   paint("drilltbl",rows,r=>`<tr class="click"><td class="num">${r.year}</td>
-      <td class="main"><strong>${eur(r.price)}</strong>${oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}
+      <td class="main"><strong>${eur(r.price)}</strong>${oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}
         ${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}<span class="s">${spec(r.c)}</span></td>
       ${baseCell(r)}${vsCell(r.vs)}
       <td class="num">${num(r.km)}${r.kmr?`<span class="s">${r.kmr}× group</span>`:""}</td>
@@ -1417,7 +1456,7 @@ function drawCars(){
   paint("cars",rows,r=>`<tr class="click">
       <td class="main"><strong>${esc(cap(r.c[C.make]))} ${esc(mname(r.c[C.model]))}</strong>${
         r.g&&r.g.is_gen?`<span class="pill gen">${esc(r.g.gen)}</span>`:""}${
-        oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
+        oddPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
         <span class="s">${spec(r.c)||"&nbsp;"}</span></td>
       <td class="num">${r.year}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
@@ -1592,6 +1631,7 @@ def main():
         sys.exit("No usable listings — scrape some data first.")
     cars = assign_groups(cars, bucket, min_n)
     cars = mark_disappeared(cars, model_scrape_times(args.db))
+    cars, duplicates = merge_duplicates(cars, args.db)
     groups = build_groups(cars, min_n)
     series = model_series(cars, max(3, min_n))
     sold = sold_summary(cars, groups)
@@ -1608,7 +1648,7 @@ def main():
     cols = ["make", "model", "grp", "year", "price", "km", "fuel", "engine",
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
-            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src"]
+            "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also"]
     prefix = "https://autoplius.lt/skelbimai/"
     packed = []
     for c in cars:
@@ -1632,7 +1672,9 @@ def main():
             1 if c.get("description_checked_at") else 0,
             round(lo) if lo else None, round(hi) if hi else None,
             c.get("power_kw"), c.get("gearbox") or "", c.get("body") or "",
-            "|".join(c["flags"]), c.get("location") or "", c.get("dealer"), c["source"]])
+            "|".join(c["flags"]), c.get("location") or "", c.get("dealer"), c["source"],
+            # the same car elsewhere: "site|price|link", several joined by "~"
+            "~".join(f"{o['source']}|{o['price_eur']}|{o['link']}" for o in c.get("also", []))])
 
     # Cheapest-looking cars nobody has read yet: these are what the targeted
     # description fetch (scrape.py --ids-file) should spend requests on.
@@ -1665,7 +1707,7 @@ def main():
             "models": len({(c["make"], c["model"]) for c in cars}),
             "median": round(statistics.median([c["price_eur"] for c in cars])),
             "drops": sum(1 for c in cars if c["drop_pct"] > 0),
-            "min_n": min_n, "sold": sold,
+            "min_n": min_n, "sold": sold, "duplicates": duplicates,
             "fitted": len(fitted),
             "baseline_err": round(statistics.median(errs), 1) if errs else None,
             "median_err": round(statistics.median([g["err_median"] for g in glist]), 1) if glist else None,
@@ -1712,6 +1754,8 @@ def main():
             print(f"  saved for scoring new ads: {pooled['saved']}")
         print("  feature coverage: " + ", ".join(
             f"{k} {v / pooled['n']:.0%}" for k, v in pooled["filled"].items()))
+    if duplicates:
+        print(f"{duplicates:,} cars are listed on two sites; each is counted once")
     print(f"{m['suspect']:,} cars flagged ({m['declared']:,} declared defects; "
           f"damage search has covered {m['damage_checked']:,} cars)")
     print(f"{min(len(unread), args.candidates)} unread candidates written to {cand_path}\n")

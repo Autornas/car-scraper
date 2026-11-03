@@ -373,6 +373,12 @@ $("logs").addEventListener("scroll",()=>{
 
 /* ---------- watcher health and deals ---------- */
 const VERDICT={deal:"deal",damaged:"damaged",problem:"problem"};
+/* "site|price|link" -> " · also on autoplius €8,900 ↗" */
+function alsoText(also){
+ if(!also)return "";
+ const [src,price,link]=also.split("|");
+ return ` · <a href="${esc(link)}" target="_blank" rel="noreferrer">also on ${esc(src)}${price?" €"+fmt(+price):""} ↗</a>`;
+}
 /* One health line per site: failing, stale, or its last scan. */
 function siteHealth(src,s,running){
  if(!s||!s.last)return [`${src}: never run yet`,""];
@@ -398,7 +404,7 @@ function renderWatcher(w,running){
   return `<div class="deal"><span class="t">${esc(d.title)} ${d.year??""}</span>
    <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
    <span class="m">${esc(d.source)} · expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
-    d.flags?" · "+esc(d.flags.split("|").join(", ")):""} · ${ago(d.found_at)} ·
+    d.flags?" · "+esc(d.flags.split("|").join(", ")):""}${alsoText(d.also)} · ${ago(d.found_at)} ·
     <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
  }).join(""):'<div class="empty">No new car under its price range yet.</div>';
 }

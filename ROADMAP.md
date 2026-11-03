@@ -212,6 +212,13 @@ work for a site searched per make (fixed, tested). A static check
 both.
 
 ### Phase 5 — Combine the sites properly (M)
+**Status: done 2026-11-04.** VINs aren't on either site's cards (only on some
+ad pages), so matching is by make, model, year, mileage, town, kW, engine,
+price and dealer with hard conflicts ruled out (`collectors/dupes.py`).
+On current data: 1,198 cars listed on both sites, counted once; 915 of the
+first 1,242 pairs had the identical price. The watcher marks new deals that
+are also listed elsewhere. `source` is a price-model feature; accuracy held
+at ±13.2%.
 1. **Cross-site duplicates:** many dealers post the same car on both sites.
    Match on VIN where known; otherwise make, model, year, km (±1%), kW, town
    and price.

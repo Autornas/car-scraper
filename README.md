@@ -23,7 +23,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   (full scrape per make, damage sweep, watcher, ad pages).
 - **In progress:** the first full pass over both sites (Autoplius
   rate-limited a faster pass; both now run at one request every ~2 s).
-- **Not started:** cross-site duplicates, multi-user website, hosting, alerts.
+- **Not started:** verdicts with admin feedback, multi-user website, hosting,
+  alerts.
 
 ### Phases
 - [x] **0. Clean foundation:** git, archive old files, `config.toml`, parser
@@ -37,7 +38,8 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   aliases per site, shared collector code in `scripts/collectors/`.
 - [x] **4. autogidas.lt collector:** parsers, full scrape per make, damage
   sweep (`f_46`), watcher (`f_50=naujausi_desc`), ad pages.
-- [ ] **5. Combine sites:** detect the same car on both, count it once.
+- [x] **5. Combine sites:** the same car on both sites is matched, counted
+  once, and shown as one row with a link to the other listing.
 - [ ] **6. Verdicts:** Deal / Damaged / Problem / Not a real price /
   Unchecked, with admin feedback.
 - [ ] **7. Web server:** FastAPI, admin and viewer roles, paginated data,
@@ -102,6 +104,26 @@ from other sites are filed under it by matching their card titles against it
 ("Mercedes-Benz C 220 T CDI" -> `mercedes-benz/c220`), so the price model
 treats a car the same whichever site it came from. `model_aliases` is there
 for a site's own names that need mapping by hand.
+
+### The same car on two sites
+
+Many sellers post a car on both sites (about 1,200 cars so far, ~13% of
+autogidas). `scripts/collectors/dupes.py` pairs them by the car itself: make,
+model and year must agree, mileage within 2%, and nothing may contradict
+(fuel, gearbox, engine, kW). A score then weighs identical mileage (less if
+it's a round number), town, kW, engine, price and dealer; a different town or
+a price more than 35% apart counts against. Each listing joins at most one
+pair, best first.
+
+- **Report:** one row per car. The cheaper listing is shown, with an
+  "also on autogidas €12,900" link to the other; the hidden one stays out of
+  the group medians and the price model's training.
+- **Watcher:** a new deal is checked against the other site, and the
+  dashboard shows "also on …" with that listing's price.
+- **Price model:** the site is now one of its inputs, in case one site's
+  asking prices run systematically higher.
+
+Pairs are rebuilt on every report build and kept in the `duplicates` table.
 
 ### autogidas.lt
 
