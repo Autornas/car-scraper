@@ -4,6 +4,83 @@ Python tools that collect public used-car listings from autoplius.lt and
 autogidas.lt into one database, catch new ads within minutes, and tell
 bargains apart from damaged or problem cars.
 
+## Quick start
+
+1. **Install** (once, from the project root in PowerShell):
+
+   ```powershell
+   py -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -r requirements.txt
+   ```
+
+2. **Start the web interface:**
+
+   ```powershell
+   .\.venv\Scripts\python.exe scripts\scraper_dashboard.py
+   ```
+
+   It opens <http://127.0.0.1:8765/admin> in your browser and starts the
+   five-minute watcher. Keep the terminal open; Ctrl+C stops everything.
+   Add `--no-watcher` to start the site without the watcher.
+
+3. **Fill the database.** On the first run it is empty. In the dashboard's
+   **Control** section press **Resume scraping** (or run
+   `python scripts\scrape.py` in a second terminal). A full first pass takes
+   several nights because both sites rate-limit long runs; the nightly job
+   (see "Nightly refresh") carries on where it stopped.
+
+4. **Build the report.** Press **Rebuild report** (or run
+   `python scripts\autoplius_stats.py`). This fits the price model and writes
+   the deals report. Then open **Deals & prices** to browse it.
+
+5. **Optional:** schedule the nightly refresh and set up Telegram alerts
+   (both described below).
+
+## How everything works
+
+```
+autoplius.lt ─┐                          ┌─ watcher (every 5 min): new ads, priced at once
+              ├─ collectors ─ database ──┼─ nightly job: re-scrape stale models, damage sweep, rebuild
+autogidas.lt ─┘   (scripts/     (data/   └─ report + price model ─ website (/admin, /)
+                  collectors/)  autoplius.db)
+```
+
+1. **Collect.** `scripts/scrape.py` walks each site model by model (autoplius)
+   or make by make (autogidas) and stores every listing, its price history and
+   its card details (kW, gearbox, body, town, dealer) in `data/autoplius.db`.
+   A site-wide damage sweep marks cars with a declared defect.
+2. **Catch new ads.** `scripts/watch.py` reads each site's newest-first list
+   every 5 minutes and stores anything it hasn't seen. New ads are priced
+   straight away; a cheap one has its ad opened and gets a verdict.
+3. **Combine sites.** The same car posted on both sites is matched and counted
+   once, shown as one row with a link to the other listing.
+4. **Price.** `scripts/autoplius_stats.py` fits one LightGBM model over all
+   cars and gives each an expected price with a p10-p90 range. Cars below the
+   range are candidates for a deal.
+5. **Judge.** Each candidate gets a verdict: *deal*, *unchecked*, *damaged*,
+   *problem* or *not a real price*. Ads of the best unchecked candidates are
+   read for problem words. You can correct any verdict with a label, and the
+   report tracks how often you agreed.
+6. **Show.** The website serves the report and the control dashboard. Admins
+   (you) start/stop tasks, edit the model list and label cars at `/admin`;
+   viewers get a read-only copy of the deals at `/`. Telegram can message you
+   about new deals.
+7. **Repeat.** The nightly job keeps the data fresh without long bursts of
+   requests, and the report rebuilds automatically when the database changes.
+
+Where things live:
+
+| Path | What |
+|---|---|
+| `config.toml` | all settings: paths, delays, enabled sites, web and alert options |
+| `data/autoplius.db` | the database (listings, price history, labels, duplicates, audit log) |
+| `data/price_model/` | the saved price model the watcher uses |
+| `data/secrets.toml` | Telegram token (kept out of git) |
+| `data/logs/` | nightly job logs |
+| `reports/` | the generated report |
+| `scripts/` | the tools; `scripts/collectors/` per-site code, `scripts/web/` the website |
+
 ## Project plan
 
 **Goal:** one PC collects every used-car listing from autoplius.lt and
@@ -20,7 +97,9 @@ and the site details behind it, is in [ROADMAP.md](ROADMAP.md).
   gap-free 5-minute watcher that prices new ads and checks cheap ones; full
   make/model catalogue with id-based searches; site-wide damage sweep;
   multi-site database and shared collector code; autogidas.lt collector
-  (full scrape per make, damage sweep, watcher, ad pages).
+  (full scrape per make, damage sweep, watcher, ad pages); same-car matching
+  across sites; verdicts and your labels; FastAPI website with admin and
+  viewer roles, audit log and Telegram alerts.
 - **In progress:** the first full pass over both sites. Both sites
   rate-limit long runs, so the nightly job finishes it a few hundred models a
   night.
@@ -55,16 +134,6 @@ Default settings live in [config.toml](config.toml): paths, request delays,
 watcher interval, report options and which sites are enabled. Command-line
 flags still override them for a single run.
 
-## Tests
-
-Parsers are tested against real pages saved in `tests/fixtures/`. When a site
-changes its layout, these tests fail instead of the scraper quietly saving
-wrong data.
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest
-```
-
 ## Setup
 
 From the project root:
@@ -74,6 +143,27 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
+
+To also run the tests, install the development requirements instead (they
+include `requirements.txt` plus pytest and pyflakes):
+
+```powershell
+python -m pip install -r requirements-dev.txt
+```
+
+## Tests
+
+Parsers are tested against real pages saved in `tests/fixtures/`. When a site
+changes its layout, these tests fail instead of the scraper quietly saving
+wrong data. With the virtual environment active and the development
+requirements installed:
+
+```powershell
+python -m pytest
+```
+
+or without activating it: `.\.venv\Scripts\python.exe -m pytest`. If that
+says `No module named pytest`, the development requirements are missing.
 
 ## Tools
 
