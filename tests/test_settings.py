@@ -23,6 +23,15 @@ def test_values_override_defaults(tmp_path):
     assert cfg["watcher"]["delay"] == settings.DEFAULTS["watcher"]["delay"]
 
 
+def test_local_file_overrides_config(tmp_path):
+    path = write(tmp_path, '[web]\nauth = "local"\nport = 9000\n[watcher]\nmax_pages = 10\n')
+    (tmp_path / "config.local.toml").write_text(
+        '[web]\nauth = "tailscale"\nadmins = ["me@x.com"]\n', encoding="utf-8")
+    cfg = settings.load(path)
+    assert cfg["web"]["auth"] == "tailscale" and cfg["web"]["admins"] == ["me@x.com"]
+    assert cfg["web"]["port"] == 9000 and cfg["watcher"]["max_pages"] == 10
+
+
 def test_unknown_keys_are_ignored(tmp_path, capsys):
     cfg = settings.load(write(tmp_path, "[watcher]\ntypo_key = 1\n"))
     assert "typo_key" not in cfg["watcher"]

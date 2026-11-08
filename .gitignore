@@ -22,3 +22,5 @@ data/price_model/
 data/logs/
 data/secrets.toml
 reports/
+
+config.local.toml

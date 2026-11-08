@@ -257,6 +257,27 @@ def test_cloudflare_mode_needs_its_settings():
         Authenticator({**WEB, "auth": "open"})
 
 
+def test_tailscale_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin, "DB_PATH", tmp_path / "t.db")
+    cfg = {**WEB, "auth": "tailscale", "admins": [ADMIN], "viewers": [VIEWER]}
+    app = create_app({"web": cfg}, Authenticator(cfg),
+                     {"jobs": FakeManager(), "watcher": FakeManager()})
+    ts = "https://pc.tail1234.ts.net"
+    client = TestClient(app, base_url=ts)
+    login = lambda who: {"Tailscale-User-Login": who}
+    assert client.get("/api/me", headers=login(ADMIN)).json()["role"] == "admin"
+    assert client.get("/api/me", headers=login(VIEWER)).json()["role"] == "viewer"
+    assert client.get("/api/me", headers=login("stranger@x.com")).status_code == 403
+    assert client.get("/api/me").status_code == 403                       # funnel: no identity
+    assert client.get("/admin", headers=login(VIEWER)).status_code == 403
+    # a forged header through any other hostname is useless
+    assert TestClient(app, base_url=SITE).get("/api/me", headers=login(ADMIN)).status_code == 403
+    assert TestClient(app, base_url="http://127.0.0.1:8765").get(
+        "/api/me", headers=login(ADMIN)).status_code == 403
+    with pytest.raises(ValueError):
+        Authenticator({**cfg, "admins": []})
+
+
 def test_launcher_only_listens_on_this_pc():
     assert launcher.is_loopback("127.0.0.1") and launcher.is_loopback("localhost")
     assert launcher.is_loopback("::1")

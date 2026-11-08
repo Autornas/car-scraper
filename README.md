@@ -20,6 +20,7 @@ bargains apart from damaged or problem cars.
    .\.venv\Scripts\python.exe scripts\scraper_dashboard.py
    ```
 
+
    It opens <http://127.0.0.1:8765/admin> in your browser and starts the
    five-minute watcher. Keep the terminal open; Ctrl+C stops everything.
    Add `--no-watcher` to start the site without the watcher.
@@ -300,11 +301,43 @@ stops the site, the watcher and any running task.
 - `auth = "local"` (default): only you, on this PC, as admin. A request that
   reaches the site through any other hostname (a tunnel) is refused, so this
   mode can't be exposed by accident.
+- `auth = "tailscale"`: reach the site from your own devices over Tailscale
+  (free, no domain), see "Remote access with Tailscale" below. Only requests
+  through your `*.ts.net` name that carry Tailscale's signed-in login are
+  served; the login must be in `admins` or `viewers`.
 - `auth = "cloudflare"`: for use behind Cloudflare Tunnel + Access. Every
   request must carry Cloudflare's signed login token; it is verified against
   your team's keys (`team_domain`), the application's AUD tag (`audience`),
   the issuer and the expiry. The email in it must be in `admins` or
   `viewers`; anyone else is refused. Setting up the tunnel is Phase 8.
+
+**Remote access with Tailscale** (watch the scrapers from another PC without
+Remote Desktop):
+
+1. Install Tailscale on the scraper PC and on each PC/phone you'll watch from,
+   and sign in to the same account (`winget install Tailscale.Tailscale`).
+2. Create `config.local.toml` (git ignores it; it overrides `config.toml` for
+   this PC only) with `[web]`, `auth = "tailscale"` and
+   `admins = ["you@gmail.com"]` (the email you sign in to Tailscale with).
+3. Auto-start the site at sign-in:
+   `powershell -ExecutionPolicy Bypass -File scripts\install_dashboard_task.ps1`
+4. On the scraper PC: `tailscale serve --bg 8765`. It prints your address,
+   `https://<pc>.<tailnet>.ts.net`. Open `/admin` there from any of your devices.
+
+**Auto-update from GitHub** (run the PC like a server): push your changes, and
+within five minutes this PC pulls them and restarts the site if code changed.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_autoupdate_task.ps1
+```
+
+It only fast-forwards, skips if tracked files have local edits, rolls back if
+the new version doesn't start, and logs to `data\logs\autoupdate.log`. A restart
+stops a running scrape (the watcher restarts itself). Remove it with `-Remove`.
+Keep PC-specific settings in `config.local.toml`, not `config.toml`.
+
+Don't use `tailscale funnel`: it makes the site public, and the site would
+refuse everyone anyway, because funnel requests carry no login.
 
 **Viewers** get a copy of the report with your labels removed (and sellers'
 descriptions too if `viewer_descriptions = false`), served compressed (~2 MB).

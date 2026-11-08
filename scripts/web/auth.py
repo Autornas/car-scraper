@@ -17,7 +17,18 @@ Two modes, chosen in config.toml ([web] auth):
               [web] admins / viewers. Anyone else is refused, even with a
               valid Cloudflare login.
 
-Never trust a plain email header: only the signed token counts.
+  tailscale   For use behind `tailscale serve`. The site stays on 127.0.0.1;
+              Tailscale Serve proxies your tailnet's HTTPS name to it and adds
+              a Tailscale-User-Login header naming the signed-in tailnet user.
+              Only requests addressed to a *.ts.net name carrying that header
+              are served, and the login decides the role ([web] admins /
+              viewers). Funnel (public internet) requests carry no such
+              header, so they are refused.
+
+Never trust a plain email header in cloudflare mode: only the signed token
+counts. (In tailscale mode the header is trustworthy only because the site
+listens on this PC alone, so only Tailscale Serve can set it; anyone who can
+already run code on this PC could fake it, but they are the admin anyway.)
 """
 
 import threading
@@ -74,8 +85,11 @@ class CloudflareKeys:
 class Authenticator:
     def __init__(self, cfg, keys=None):
         self.mode = cfg["auth"]
-        if self.mode not in ("local", "cloudflare"):
-            raise ValueError(f"[web] auth must be 'local' or 'cloudflare', not {self.mode!r}")
+        if self.mode not in ("local", "cloudflare", "tailscale"):
+            raise ValueError(f"[web] auth must be 'local', 'cloudflare' or 'tailscale', "
+                             f"not {self.mode!r}")
+        if self.mode == "tailscale" and not cfg["admins"]:
+            raise ValueError("[web] auth = 'tailscale' needs at least one login in admins")
         self.admins = {e.strip().lower() for e in cfg["admins"] if isinstance(e, str)}
         self.viewers = {e.strip().lower() for e in cfg["viewers"] if isinstance(e, str)}
         self.team_domain = cfg["team_domain"].strip()
@@ -104,8 +118,19 @@ class Authenticator:
             hostname = host.split("]")[0] + "]" if host.startswith("[") else host.split(":")[0]
             if hostname not in LOCAL_HOSTS:
                 raise AuthError(403, "This dashboard only answers on this PC. To use it from "
-                                     "elsewhere, set [web] auth = 'cloudflare'.")
+                                     "elsewhere, set [web] auth = 'tailscale' or 'cloudflare'.")
             return User("local", "admin")
+
+        if self.mode == "tailscale":
+            host = (host or "").lower().split(":")[0]
+            login = (headers.get("tailscale-user-login") or "").strip()
+            if not host.endswith(".ts.net") or not login:
+                raise AuthError(403, "Open this site through your Tailscale name "
+                                     "(https://<pc>.<tailnet>.ts.net) while signed in to Tailscale.")
+            role = self.role_for(login)
+            if role is None:
+                raise AuthError(403, f"{login} has no access to this site.")
+            return User(login, role)
 
         token = headers.get("cf-access-jwt-assertion") or cookies.get("CF_Authorization")
         if not token:

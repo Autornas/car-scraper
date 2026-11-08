@@ -42,10 +42,11 @@ def main():
     if not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
     # Local mode trusts whoever can reach it; that must only ever be this PC.
-    # (Cloudflare Tunnel also connects locally, so cloudflare mode binds here too.)
+    # (Cloudflare Tunnel and Tailscale Serve also connect locally.)
     if not is_loopback(args.host):
         sys.exit(f"Refusing to listen on {args.host}: the site only listens on this PC "
-                 "(127.0.0.1). Reach it from elsewhere through Cloudflare Tunnel + Access.")
+                 "(127.0.0.1). Reach it from elsewhere through Tailscale Serve or "
+                 "Cloudflare Tunnel + Access.")
     try:
         app = create_app(start_watcher=not args.no_watcher)
     except ValueError as exc:

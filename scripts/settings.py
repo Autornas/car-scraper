@@ -110,15 +110,29 @@ def _merge(defaults, overrides, where):
     return merged
 
 
-def load(path=CONFIG_PATH):
+def _deep_update(base, extra):
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load(path=CONFIG_PATH, local_path=None):
+    """config.toml, then config.local.toml (same folder, not in git) on top:
+    settings that belong to one PC, like [web] auth and admins, go there."""
     path = Path(path)
-    if not path.exists():
-        return deepcopy(DEFAULTS)
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        sys.exit(f"{path} is not valid TOML: {exc}")
-    return _merge(DEFAULTS, data, "")
+    local_path = Path(local_path) if local_path else path.with_name("config.local.toml")
+    data = {}
+    for p in (path, local_path):
+        if not p.exists():
+            continue
+        try:
+            _deep_update(data, tomllib.loads(p.read_text(encoding="utf-8")))
+        except tomllib.TOMLDecodeError as exc:
+            sys.exit(f"{p} is not valid TOML: {exc}")
+    return _merge(DEFAULTS, data, "") if data else deepcopy(DEFAULTS)
 
 
 def project_path(value):

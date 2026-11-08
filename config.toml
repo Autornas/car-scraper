@@ -52,9 +52,10 @@ deals = true             # every new car the watcher rates "deal"
 watcher_failures = true  # a site's watcher failing 3 scans in a row
 
 [web]
+# This PC's own values (auth, admins, ...) live in config.local.toml, which git ignores.
 host = "127.0.0.1"       # only this PC; others reach it through Cloudflare Tunnel
 port = 8765
-auth = "local"           # "local": only you on this PC; "cloudflare": signed-in users
+auth = "local"           # "local": only you on this PC; "tailscale": your tailnet (admins below); "cloudflare": signed-in users
 team_domain = ""         # cloudflare: e.g. "yourteam.cloudflareaccess.com"
 audience = ""            # cloudflare: the Access application's AUD tag
 admins = []              # cloudflare: e.g. ["you@gmail.com"]
