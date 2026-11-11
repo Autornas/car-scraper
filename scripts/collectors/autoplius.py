@@ -268,10 +268,21 @@ def parse_listing(anchor, link: str, ad_id: str):
 
     price = parse_price(text)
 
+    # Mileage: the card's own parameter line ("275 428 km") first. The card text
+    # also carries dealer warranty badges ("3 000 km arba 2 mėn. pardavėjo
+    # garantija") BEFORE the parameters, which used to be read as the mileage:
+    # 405 cars were stored with exactly 3,000 km.
     mileage = None
-    m = re.search(r"(\d[\d\s.,]*)\s*km", text, re.IGNORECASE)
-    if m:
-        mileage = clean_number(m.group(1))
+    for span in node.select(".announcement-parameters span"):
+        value = span.get_text(" ", strip=True)
+        if re.fullmatch(r"[\d\s.,\xa0]+km", value, re.IGNORECASE):
+            mileage = clean_number(value)
+            break
+    if mileage is None:
+        for m in re.finditer(r"(\d[\d\s.,]*)\s*km\b(?!\s*arba)(?![^€]{0,20}garantij)",
+                             text, re.IGNORECASE):
+            mileage = clean_number(m.group(1))
+            break
 
     engine = slug_engine
     m = re.search(r"(\d[.,]\d)\s*l\.", text, re.IGNORECASE)

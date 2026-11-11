@@ -44,7 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.dupes import find_duplicates, save_duplicates
-from collectors.verdicts import (IMPLAUSIBLE_SHARE, VERDICTS, classify, label_agrees,
+from collectors.verdicts import (IMPLAUSIBLE_SHARE, TOO_CHEAP_FLAG, VERDICTS, classify,
+                                 label_agrees, too_cheap,
                                  country_flags, load_labels, text_flags)
 from collectors.store import Store
 from settings import SETTINGS, project_path
@@ -66,6 +67,17 @@ MIN_FIT_N = 25
 # Failing either drops the mileage only — the price is still a usable data point.
 MAX_KM = 900_000
 MAX_KM_PER_YEAR = 100_000
+# ... and too little: a 2004 Volvo with "326 km" (326,000 typed in thousands)
+# was priced like a car nobody had driven. Cars older than MIN_KM_AGE years
+# with under MIN_KM_PER_YEAR per year of age have their mileage treated as
+# unknown. Real garage queens (a 1991 cabrio at 30,000 km) stay above it.
+MIN_KM_AGE = 3
+MIN_KM_PER_YEAR = 1_000
+
+
+def implausibly_low_km(km, age):
+    """A mileage no car of this age (years) honestly shows."""
+    return bool(km) and age > MIN_KM_AGE and km < MIN_KM_PER_YEAR * age
 
 # Starter generation table. Each entry: [year_the_generation_STARTED, name].
 # A car is assigned the latest generation whose start year <= its year.
@@ -595,7 +607,7 @@ def load(db_path, compiled, min_price, max_price):
         km = c["mileage_km"]
         if km is not None and km > 0:
             age = max(1, this_year - c["year"])
-            if km > MAX_KM or km / age > MAX_KM_PER_YEAR:
+            if km > MAX_KM or km / age > MAX_KM_PER_YEAR or implausibly_low_km(km, age):
                 c["mileage_km"] = None
                 skipped["impossible mileage"] += 1
         elif km is not None and km <= 0:
@@ -728,6 +740,54 @@ def mark_stale(cars, days, now=None):
         c["seen_date"] = seen.date().isoformat() if seen else ""
         c["stale"] = bool(seen and not c["gone"]
                           and (now - seen).total_seconds() > days * 86400)
+    return cars
+
+
+# Similar cars: what the report compares each car with, besides the model.
+SIMILAR_YEARS = 1          # year +-1
+SIMILAR_KM = 0.3           # mileage +-30% (when the car's mileage is known)
+SIMILAR_MIN = 5            # fewer than this: too few to say anything
+# The typical range shown is the 25th-75th percentile: half of identical cars
+# sit inside it. The model gives p10 / p50 / p90 (the deal threshold stays at
+# p10); assuming log prices spread normally, p25 lies this share of the way
+# from p50 to p10: z(0.75) / z(0.90) = 0.6745 / 1.2816.
+Q25_SHARE = 0.6745 / 1.2816
+
+
+def typical_range(lo, mid, hi):
+    """(p25, p75) from the model's (p10, p50, p90)."""
+    if not (lo and mid and hi):
+        return None, None
+    return mid * (lo / mid) ** Q25_SHARE, mid * (hi / mid) ** Q25_SHARE
+
+
+def attach_similar(cars, years=SIMILAR_YEARS, km_share=SIMILAR_KM, min_n=SIMILAR_MIN):
+    """
+    For every car, the asking prices of the most similar cars in the database:
+    same make/model, year within `years`, mileage within `km_share` when known,
+    same fuel when that still leaves `min_n`. Cars with a flag (damage, problem
+    words) or a fake price are not used as comparisons. Sets c["similar"] to
+    (n, how many are cheaper, median, p25, p75), or n = 0 with no similar car.
+    The same comparison the watcher makes (collectors.watch.similar_prices).
+    """
+    by_model = defaultdict(list)
+    for c in cars:
+        if c["price_eur"] and not c.get("suspect") and not c.get("price_outlier"):
+            by_model[(c["make"], c["model"])].append(c)
+    for c in cars:
+        km, fuel = c.get("mileage_km"), c.get("fuel")
+        near = [o for o in by_model.get((c["make"], c["model"]), ())
+                if o is not c and abs(o["year"] - c["year"]) <= years
+                and (not km or (o.get("mileage_km")
+                                and km * (1 - km_share) <= o["mileage_km"] <= km * (1 + km_share)))]
+        same_fuel = [o for o in near if fuel and o.get("fuel") == fuel]
+        prices = sorted(o["price_eur"] for o in (same_fuel if len(same_fuel) >= min_n else near))
+        if not prices:
+            c["similar"] = (0, 0, None, None, None)
+            continue
+        c["similar"] = (len(prices), sum(1 for x in prices if x < c["price_eur"]),
+                        round(statistics.median(prices)), round(pct(prices, 0.25)),
+                        round(pct(prices, 0.75)))
     return cars
 
 
@@ -988,6 +1048,11 @@ HTML = r"""<!doctype html>
   svg{display:block;width:100%;overflow:visible}
   .scrollpane{flex:1;min-height:0;overflow:auto}
   .muted{color:var(--text-muted);font-size:12px}
+  /* where the price sits in its range: p10-p90 faint, p25-p75 strong, dot = price */
+  .rbar{display:block;margin:4px 0 0 auto;width:120px;height:10px;overflow:visible}
+  .rbar .wide{fill:var(--surface-3)}.rbar .mid{fill:var(--series-1);opacity:.45}
+  .rbar .dot{fill:var(--text-primary);stroke:var(--surface-1);stroke-width:1.5}
+  .rbar .dot.under{fill:var(--good)}.rbar .dot.over{fill:var(--bad)}
   .count{color:var(--text-muted);font-size:12px}
   .empty{padding:22px;color:var(--text-muted);font-size:14px;text-align:center}
   /* Not wide enough for groups and their cars side by side: stack them, each
@@ -1072,7 +1137,8 @@ HTML = r"""<!doctype html>
     <th data-k="car">Car</th>
     <th class="num" data-k="year">Year</th>
     <th class="num" data-k="price">Price</th>
-    <th class="num" data-k="base">Expected <span class="muted">/ range</span></th>
+    <th class="num" data-k="base">Expected <span class="muted">/ typical range</span></th>
+    <th class="num" data-k="simrank">Similar cars</th>
     <th class="num" data-k="vslo">vs low end</th>
     <th class="num" data-k="vs">vs expected</th>
     <th class="num" data-k="km">km</th>
@@ -1145,6 +1211,8 @@ const detailRow = (c, cols) => {
     ["First price", c[C.first] && c[C.first]!==c[C.price] ? eur(c[C.first]) : ""],
     ["Days listed", c[C.days]], ["Flags", (c[C.flags]||"").split("|").join(", ")],
     ["Also listed", alsoList(c).map(o => `${o.src} ${o.price ? eur(o.price) : ""}`).join(", ")],
+    ["Typical range", c[C.q25] ? `${eur(c[C.q25])}–${eur(c[C.q75])} (low end ${eur(c[C.lo])}, high ${eur(c[C.hi])})` : ""],
+    ["Similar cars", c[C.sim] ? `${c[C.sim][0]} · median ${eur(c[C.sim][2])} · middle half ${eur(c[C.sim][3])}–${eur(c[C.sim][4])}` : ""],
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
     d ? `<div class="desc">${esc(d)}</div>`
@@ -1274,8 +1342,11 @@ document.getElementById("tiles").innerHTML=[
 document.getElementById("basisNote").textContent = DATA.meta.pooled
   ? "Each car is compared with a pooled price model trained on every listing (make, model, "
     + "generation, year, mileage, fuel, engine, kW, gearbox, body, seller type, declared damage), "
-    + "using a model that never saw that car. Expected is its median; Range is the 10th-90th "
-    + "percentile for an identical car."
+    + "using a model that never saw that car. Expected is its median. The typical range is "
+    + "where half of identical cars sit (25th-75th percentile); the bar under it also shows the "
+    + "10th-90th, and the dot is this car's price. The low end used for deals is the 10th "
+    + "percentile. Similar cars are real listings: same model, year ±1, mileage ±30%, no "
+    + "declared defect; the column says how many cost more than this one, and their median."
   : "Each car is compared with its group's km+year model, or the group median "
     + "(med) where no model earned its place. Install lightgbm for per-car price ranges.";
 const SORT={groups:{k:"n",d:-1},cars:{k:"vslo",d:-1},drops:{k:"drop",d:-1},drilltbl:{k:"price",d:1}};
@@ -1410,12 +1481,33 @@ function carRow(c,g){
     year:c[C.year], price:c[C.price],
     base, modelled:c[C.exp]!=null,
     vs: base ? (base-c[C.price])/base*100 : null,
-    lo:c[C.lo], hi:c[C.hi],
+    lo:c[C.lo], hi:c[C.hi], q25:c[C.q25], q75:c[C.q75], sim:c[C.sim],
+    /* sorts best first: the share of similar cars that cost more */
+    simrank: c[C.sim] ? (c[C.sim][0]-c[C.sim][1])/c[C.sim][0] : null,
     vslo: c[C.lo] ? (c[C.lo]-c[C.price])/c[C.lo]*100 : null,
     kw:c[C.kw], gear:c[C.gear]||null,
     km:c[C.km], kmr:c[C.kmr], fuel:c[C.fuel]||null, engine:c[C.engine]||null,
     drop:c[C.drop]||null, first:c[C.first], days:c[C.days],
     median:g?g.median:null};
+}
+/* p10-p90 faint, p25-p75 strong, the car's price as a dot */
+function rangeBar(r){
+  if(!r.lo||!r.hi||!r.q25)return "";
+  const a=Math.min(r.lo,r.price), b=Math.max(r.hi,r.price), W=120, x=v=>(v-a)/((b-a)||1)*W;
+  const cls=r.price<r.q25?"under":r.price>r.q75?"over":"";
+  return `<svg class="rbar" viewBox="0 0 ${W} 10" aria-hidden="true">
+    <rect class="wide" x="${x(r.lo)}" y="3" width="${x(r.hi)-x(r.lo)}" height="4" rx="2"/>
+    <rect class="mid" x="${x(r.q25)}" y="2" width="${x(r.q75)-x(r.q25)}" height="6" rx="2"/>
+    <circle class="dot ${cls}" cx="${x(r.price)}" cy="5" r="3.5"/></svg>`;
+}
+/* "cheaper than 20 of 26 / median €1,475" */
+function simCell(sim){
+  if(!sim)return `<td class="num"><span class="s">no similar cars</span></td>`;
+  const [n,cheaper,median]=sim, more=n-cheaper;
+  const few=n<5;
+  return `<td class="num" title="real listings: same model, year ±1, mileage ±30%, no declared defect${
+    few?" — too few to be sure":""}"><span${few?' class="s"':""}>cheaper than ${more} of ${n}</span>
+    <span class="s">median ${eur(median)}</span></td>`;
 }
 const baseCell = r => `<td class="num" title="${!r.modelled
     ? "group median — this group has no price model"
@@ -1535,13 +1627,14 @@ function drawCars(){
         <span class="s">${spec(r.c)||"&nbsp;"}</span></td>
       <td class="num">${r.year}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
-      <td class="num" title="${r.modelled?"what the model expects for this exact car":"group median"}">${
+      <td class="num" title="${r.modelled?"what the model expects for this exact car; half of identical cars sit in the typical range":"group median"}">${
         eur(r.base)}${r.modelled?"":'<span class="pill">med</span>'}<span class="s">${
-        r.lo?eur(r.lo)+"–"+eur(r.hi):"&nbsp;"}</span></td>
+        r.q25?eur(r.q25)+"–"+eur(r.q75):"&nbsp;"}</span>${rangeBar(r)}</td>
+      ${simCell(r.sim)}
       ${vsCell(r.vslo)}${vsCell(r.vs)}
       <td class="num">${num(r.km)}${r.kmr?`<span class="s"${r.kmr>1.3?' style="color:var(--warn)"':""}>${r.kmr}× group</span>`:""}</td>
-      <td>${alink(r.c[C.link])}</td></tr>${detailRow(r.c,8)}`,
-    8,"no candidates match the filters");
+      <td>${alink(r.c[C.link])}</td></tr>${detailRow(r.c,9)}`,
+    9,"no candidates match the filters");
 }
 wireExpand("cars");
 
@@ -1674,6 +1767,7 @@ def main():
     cars, duplicates = merge_duplicates(cars, args.db)
     groups = build_groups(cars, min_n)
     sold = sold_summary(cars, groups)
+    attach_similar(cars)
 
     pooled = None
     if not args.no_pooled:
@@ -1688,7 +1782,7 @@ def main():
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
             "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also",
-            "aid", "verdict", "label", "stale", "seen"]
+            "aid", "verdict", "label", "stale", "seen", "q25", "q75", "sim"]
     con = sqlite3.connect(args.db)
     try:
         labels = load_labels(con)
@@ -1706,9 +1800,21 @@ def main():
             exp = expected_price(g["fit"], c["mileage_km"], c["year"]) if g else None
             lo = hi = None
         c["exp"], c["lo"] = exp, lo
+        sim_n, sim_cheaper, sim_median, _, _ = c["similar"]
+        # Nothing in the ad explains it, yet it costs half of what enough
+        # similar cars ask: not a real price (as in the watcher).
+        if not c["flags"] and too_cheap(c["price_eur"], sim_n, sim_median, SIMILAR_MIN):
+            c["flags"] = [TOO_CHEAP_FLAG]
         c["verdict"] = classify(c["price_eur"], lo, exp, c["suspect_declared"], c["flags"],
                                 read=bool(c.get("description_checked_at")),
                                 outlier=bool(c.get("price_outlier")))
+        # The model calls it cheap, but enough similar cars cost less: not a
+        # candidate. (Cheapest quarter and 10% under their median, as in the
+        # watcher's market_check.)
+        if c["verdict"] in ("deal", "unchecked") and sim_n >= SIMILAR_MIN \
+                and not (sim_cheaper <= 0.25 * sim_n and c["price_eur"] <= 0.9 * sim_median):
+            c["verdict"] = None
+        q25, q75 = typical_range(lo, exp, c.get("p_hi") if pooled else None)
         c["label"] = labels.get((c["source"], c["id"]))
         packed.append([
             c["make"], c["model"], c["grp"], c["year"], c["price_eur"],
@@ -1725,7 +1831,9 @@ def main():
             # the same car elsewhere: "site|price|link", several joined by "~"
             "~".join(f"{o['source']}|{o['price_eur']}|{o['link']}" for o in c.get("also", [])),
             c["id"], c["verdict"] or "", c["label"] or "",
-            1 if c["stale"] else 0, c["seen_date"]])
+            1 if c["stale"] else 0, c["seen_date"],
+            round(q25) if q25 else None, round(q75) if q75 else None,
+            list(c["similar"]) if c["similar"][0] else None])
 
     # The "unchecked" cars, best first: what the targeted description fetch
     # (scrape.py --ids-file) should spend its requests on. Reading their ads
@@ -1792,7 +1900,8 @@ def main():
           + (f" · {skipped_total} skipped ({detail})" if skipped_total else ""))
     if bad_mileage:
         print(f"{bad_mileage} mileage readings discarded as impossible "
-              f"(> {MAX_KM:,} km or > {MAX_KM_PER_YEAR:,} km/year)")
+              f"(> {MAX_KM:,} km, > {MAX_KM_PER_YEAR:,} km/year, or under "
+              f"{MIN_KM_PER_YEAR:,} km/year on a car over {MIN_KM_AGE} years old)")
     print(f"{m['models']} models · {m['groups']} groups of {min_n}+ "
           f"({m['gen_groups']} by generation + year band, rest by year band)")
     print(f"Overall median EUR {m['median']:,} · {m['drops']} price cuts · "

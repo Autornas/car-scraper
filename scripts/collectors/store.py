@@ -286,13 +286,18 @@ class SiteStore:
                         """UPDATE listings
                            SET last_seen = ?, seen_count = seen_count + 1,
                                price_eur = ?, make = ?, model = ?,
+                               mileage_km = COALESCE(?, mileage_km),
                                power_kw = COALESCE(?, power_kw),
                                gearbox  = COALESCE(?, gearbox),
                                body     = COALESCE(?, body),
                                location = COALESCE(?, location),
                                dealer   = COALESCE(?, dealer)
                            WHERE source = ? AND id = ?""",
-                        (ts, price, row_make, row_model, *card, self.source, r["id"]))
+                        # Mileage is re-read too, so a scrape repairs a
+                        # mis-parsed one (the "3,000 km" warranty badge).
+                        (ts, price, row_make, row_model,
+                         r["mileage_km"] if r["mileage_km"] != "" else None,
+                         *card, self.source, r["id"]))
                     if price is not None and price != existing[0]:
                         cur.execute("INSERT INTO price_history VALUES (?,?,?,?)",
                                     (self.source, r["id"], ts, price))

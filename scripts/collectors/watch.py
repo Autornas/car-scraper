@@ -540,7 +540,7 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
     """Price new ads; read the ad of each one under its range; record verdicts."""
     if model is None or not rows:
         return 0
-    from autoplius_stats import generation_for
+    from autoplius_stats import generation_for, implausibly_low_km
     cheap = 0
     min_n, min_discount = getattr(args, "min_similar", 5), getattr(args, "min_discount", 0.10)
     wanted = watch.watchlist()             # read every scan: edits apply at once
@@ -548,8 +548,11 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
         if row["price_eur"] == "" or not row["year"]:
             continue
         make, model_name = watch.db.canonical(row["_make"], row["_model"])
+        km = row["mileage_km"] or None
+        if km and implausibly_low_km(km, max(1, found.year - row["year"])):
+            km = None                      # "326 km" on a 2004 car: priced as unknown
         car = {"source": site.SOURCE, "make": make, "model": model_name, "year": row["year"],
-               "mileage_km": row["mileage_km"] or None, "fuel": row["fuel"],
+               "mileage_km": km, "fuel": row["fuel"],
                "engine_l": row["engine_l"], "power_kw": row["power_kw"],
                "gearbox": row["gearbox"], "body": row["body"], "dealer": row["dealer"],
                "gen": generation_for(make, model_name, row["year"], compiled),
