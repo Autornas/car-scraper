@@ -498,17 +498,6 @@ def breakdown(members, key, min_n=3, limit=6):
     return sorted(rows, key=lambda r: -r["n"])[:limit]
 
 
-def depreciation(pts):
-    """Annualised %/yr implied by the oldest vs newest median in a model series."""
-    if len(pts) < 2:
-        return None
-    lo, hi = pts[0], pts[-1]
-    span = hi["year"] - lo["year"]
-    if span <= 0 or lo["median"] <= 0 or hi["median"] <= 0:
-        return None
-    return round((1 - (lo["median"] / hi["median"]) ** (1 / span)) * 100, 1)
-
-
 def ensure_generations(path):
     p = Path(path)
     if p.exists():
@@ -894,31 +883,6 @@ def verdict_summary(cars):
     return rows
 
 
-def model_series(cars, min_n):
-    per = defaultdict(lambda: defaultdict(list))
-    for c in cars:
-        per[(c["make"], c["model"])][c["year"]].append(c["price_eur"])
-    series = {}
-    for (make, model), years in per.items():
-        pts = []
-        for y in sorted(years):
-            prices = years[y]
-            if len(prices) < min_n:
-                continue
-            pts.append({"year": y, "n": len(prices),
-                        "lo": round(min(prices)), "hi": round(max(prices)),
-                        "p25": round(pct(prices, 0.25)),
-                        "median": round(statistics.median(prices)),
-                        "p75": round(pct(prices, 0.75))})
-        if len(pts) >= 3:
-            for prev, cur in zip(pts, pts[1:]):        # year-on-year step
-                cur["yoy"] = round((cur["median"] - prev["median"]) / prev["median"] * 100, 1) \
-                    if prev["median"] else None
-            series[f"{make}/{model}"] = {"pts": pts, "dep": depreciation(pts),
-                                         "n": sum(p["n"] for p in pts)}
-    return dict(sorted(series.items(), key=lambda kv: -kv[1]["n"]))
-
-
 HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -927,15 +891,15 @@ HTML = r"""<!doctype html>
   :root{color-scheme:light;
     --surface-1:#fcfcfb;--surface-2:#f3f3f1;--surface-3:#e9e9e6;--border:#dcdcd8;
     --text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#7a7975;
-    --series-1:#2a78d6;--band:#2a78d633;--good:#0b8a0b;--warn:#ec835a;--bad:#c93c3c;}
+    --series-1:#2a78d6;--good:#0b8a0b;--warn:#ec835a;--bad:#c93c3c;}
   @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
     --surface-1:#1a1a19;--surface-2:#232322;--surface-3:#2d2d2b;--border:#3a3a38;
     --text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#96958c;
-    --series-1:#3987e5;--band:#3987e540;--good:#3fbf3f;--warn:#ec835a;--bad:#ff8080;}}
+    --series-1:#3987e5;--good:#3fbf3f;--warn:#ec835a;--bad:#ff8080;}}
   :root[data-theme="dark"]{color-scheme:dark;
     --surface-1:#1a1a19;--surface-2:#232322;--surface-3:#2d2d2b;--border:#3a3a38;
     --text-primary:#fff;--text-secondary:#c3c2b7;--text-muted:#96958c;
-    --series-1:#3987e5;--band:#3987e540;--good:#3fbf3f;--warn:#ec835a;--bad:#ff8080;}
+    --series-1:#3987e5;--good:#3fbf3f;--warn:#ec835a;--bad:#ff8080;}
   *{box-sizing:border-box}
   [hidden]{display:none!important}
   html,body{height:100%}
@@ -1021,12 +985,8 @@ HTML = r"""<!doctype html>
   details.help p{margin:6px 0 0}
   .note{background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--series-1);
     border-radius:8px;padding:10px 12px;font-size:13px;color:var(--text-secondary);margin-bottom:10px}
-  .chartbox{flex:1;min-height:0;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:12px;display:flex}
-  .chartbox svg{flex:1;min-height:0;height:100%}
   svg{display:block;width:100%;overflow:visible}
   .scrollpane{flex:1;min-height:0;overflow:auto}
-  .tip{position:fixed;pointer-events:none;background:var(--surface-1);border:1px solid var(--border);
-    border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 6px 20px #0003;opacity:0;transition:opacity .1s;z-index:9}
   .muted{color:var(--text-muted);font-size:12px}
   .count{color:var(--text-muted);font-size:12px}
   .empty{padding:22px;color:var(--text-muted);font-size:14px;text-align:center}
@@ -1040,7 +1000,6 @@ HTML = r"""<!doctype html>
     .app{height:auto;min-height:100vh;padding:12px}
     .split{grid-template-rows:none}
     .tablebox{max-height:75vh;flex:none}
-    .chartbox{height:340px;flex:none}
     input.txt{width:100%}
   }
 </style></head><body><div class="app">
@@ -1053,7 +1012,6 @@ HTML = r"""<!doctype html>
 <nav class="tabs" role="tablist" aria-label="Views">
   <button class="tab" role="tab" id="t-cars" aria-controls="p-cars" data-p="cars" aria-selected="true" tabindex="0">Deals</button>
   <button class="tab" role="tab" id="t-groups" aria-controls="p-groups" data-p="groups" aria-selected="false" tabindex="-1">Groups</button>
-  <button class="tab" role="tab" id="t-chart" aria-controls="p-chart" data-p="chart" aria-selected="false" tabindex="-1">Price by year</button>
   <button class="tab" role="tab" id="t-drops" aria-controls="p-drops" data-p="drops" aria-selected="false" tabindex="-1">Price drops</button>
   <button class="tab" role="tab" id="t-sold" aria-controls="p-sold" data-p="sold" aria-selected="false" tabindex="-1">Verdicts &amp; sold speed</button>
 </nav>
@@ -1144,18 +1102,6 @@ HTML = r"""<!doctype html>
   </div>
 </section>
 
-<section class="panel" id="p-chart" hidden role="tabpanel" aria-labelledby="t-chart">
-  <div class="bar">
-    <label class="muted" for="makeSel">Make</label><select id="makeSel"></select>
-    <label class="muted" for="modelSel">Model</label><select id="modelSel"></select>
-    <label class="toggle"><input type="checkbox" id="logY">Log scale</label>
-    <span class="muted">median line, shaded band = p25–p75</span>
-  </div>
-  <div class="muted" id="chartTitle"></div>
-  <div class="chartbox"><svg id="chart" viewBox="0 0 900 340" preserveAspectRatio="xMidYMid meet" role="img"
-    aria-label="Median price by year"></svg></div>
-</section>
-
 <section class="panel" id="p-drops" hidden role="tabpanel" aria-labelledby="t-drops">
   <div class="bar"><span class="muted">Cars whose asking price was cut since first seen — a seller who drops the price is negotiable. Fills in as you re-scrape.</span>
     <span class="spacer"></span><span class="count" id="dropsCount"></span></div>
@@ -1171,7 +1117,7 @@ HTML = r"""<!doctype html>
 <section class="panel" id="p-sold" hidden role="tabpanel" aria-labelledby="t-sold">
   <div class="scrollpane" id="soldbox"></div>
 </section>
-</div><div class="tip" id="tip"></div>
+</div>
 <script>
 const DATA = __DATA__;
 const C = DATA.cols.reduce((a,k,i)=>(a[k]=i,a),{});
@@ -1427,9 +1373,8 @@ function selectTab(t){
   TABS.forEach(x=>{const on=x===t;
     x.setAttribute("aria-selected",on);x.tabIndex=on?0:-1;
     document.getElementById("p-"+x.dataset.p).hidden=!on;});
-  /* The car filters mean nothing on the chart or the sold summary. */
-  document.getElementById("filters").hidden = ["chart","sold"].includes(t.dataset.p);
-  if(t.dataset.p==="chart") drawChart();
+  /* The car filters mean nothing on the sold summary. */
+  document.getElementById("filters").hidden = t.dataset.p==="sold";
 }
 TABS.forEach((t,i)=>{
   t.onclick=()=>selectTab(t);
@@ -1682,66 +1627,7 @@ function drawSold(){
 
 function renderAll(){countMatches();drawGroups();drawDrill();drawCars();drawDrops();drawSold();}
 
-/* ---------- chart ---------- */
-const makeSel=document.getElementById("makeSel"),sel=document.getElementById("modelSel");
-const tip=document.getElementById("tip");
-const byMake={};
-Object.keys(DATA.series).forEach(k=>{const i=k.indexOf("/");const mk=k.slice(0,i);
-  (byMake[mk]=byMake[mk]||[]).push(k);});
-makeSel.innerHTML=Object.keys(byMake).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("");
-function fillModels(){sel.innerHTML=(byMake[makeSel.value]||[]).map(k=>
-  `<option value="${esc(k)}">${esc(k.slice(k.indexOf("/")+1))} (${DATA.series[k].n})</option>`
-  ).join("");}
-makeSel.onchange=()=>{fillModels();drawChart();};
-sel.onchange=drawChart;
-let logTouched=false;
-document.getElementById("logY").onchange=()=>{logTouched=true;drawChart();};
-function drawChart(){
-  const ser=DATA.series[sel.value], pts=ser?ser.pts:[];
-  document.getElementById("chartTitle").innerHTML = !ser ? "" :
-    `${esc(sel.value)} · ${ser.n.toLocaleString()} cars · loses about
-     <strong>${ser.dep==null?"—":ser.dep+"%"}</strong> of its value per model year`;
-  const W=900,H=340,L=64,R=16,T=16,B=40,el=document.getElementById("chart");
-  if(pts.length<2){el.innerHTML=`<text x="20" y="30" fill="var(--text-muted)">not enough data</text>`;return;}
-  const xs=pts.map(p=>p.year),lo=Math.min(...pts.map(p=>p.p25)),hi=Math.max(...pts.map(p=>p.p75));
-  const xmin=Math.min(...xs),xspan=(Math.max(...xs)-xmin)||1;
-  const px=year=>L+(year-xmin)/xspan*(W-L-R);
-  /* Depreciation is multiplicative, so a wide-range series is unreadable on a
-     linear axis — a6 spans €599 to €55,550 and flattens 1998-2012 onto the axis.
-     Default to log whenever the range is wide enough for that to bite. */
-  const logBox=document.getElementById("logY"), logOK=lo>0&&hi/lo>8;
-  if(!logTouched) logBox.checked=logOK;      /* until the reader overrides it */
-  logBox.disabled=!(lo>0);
-  const log=logBox.checked&&lo>0;
-  const t=v=>log?Math.log(v):v, tlo=t(lo), tspan=(t(hi)-tlo)||1;
-  const py=v=>T+(1-(t(v)-tlo)/tspan)*(H-T-B);
-  let s="<g>";
-  [...Array(5)].map((_,i)=>log?Math.exp(tlo+tspan*i/4):lo+(hi-lo)*i/4).forEach(v=>{
-    s+=`<line x1="${L}" x2="${W-R}" y1="${py(v)}" y2="${py(v)}" stroke="var(--border)" stroke-width="1"/>
-        <text x="${L-10}" y="${py(v)+4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${eur(v)}</text>`;});
-  s+=`<path d="M${pts.map(p=>px(p.year)+","+py(p.p75)).join(" L")} L${
-      pts.slice().reverse().map(p=>px(p.year)+","+py(p.p25)).join(" L")} Z" fill="var(--band)"/>`;
-  s+=`<path d="M${pts.map(p=>px(p.year)+","+py(p.median)).join(" L")}" fill="none"
-      stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
-  pts.forEach(p=>{s+=`<circle cx="${px(p.year)}" cy="${py(p.median)}" r="4.5" fill="var(--series-1)"
-      stroke="var(--surface-2)" stroke-width="2" data-y="${p.year}" data-n="${p.n}" data-m="${p.median}"
-      data-a="${p.p25}" data-b="${p.p75}" data-lo="${p.lo}" data-hi="${p.hi}"
-      data-yoy="${p.yoy==null?"":p.yoy}"/>`;});
-  const step=Math.ceil(pts.length/8);
-  pts.forEach((p,i)=>{if(i%step===0||i===pts.length-1)
-    s+=`<text x="${px(p.year)}" y="${H-B+18}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${p.year}</text>`;});
-  el.innerHTML=s+"</g>";
-  el.querySelectorAll("circle").forEach(c=>{
-    c.onmouseenter=e=>{const d=e.target.dataset;
-      tip.innerHTML=`<strong>${d.y}</strong> &middot; ${d.n} cars<br>median <strong>${eur(+d.m)}</strong>
-        ${d.yoy?` <span class="${+d.yoy<0?"":"flag"}">${+d.yoy>0?"+":""}${d.yoy}% vs ${+d.y-1}</span>`:""}
-        <br><span class="muted">p25 ${eur(+d.a)} &middot; p75 ${eur(+d.b)}</span>
-        <br><span class="muted">cheapest ${eur(+d.lo)} &middot; dearest ${eur(+d.hi)}</span>`;
-      tip.style.opacity=1;};
-    c.onmousemove=e=>{tip.style.left=(e.clientX+14)+"px";tip.style.top=(e.clientY-10)+"px";};
-    c.onmouseleave=()=>tip.style.opacity=0;});
-}
-fillModels();drawChart();renderAll();
+renderAll();
 </script></body></html>"""
 
 
@@ -1787,7 +1673,6 @@ def main():
     cars = mark_stale(cars, CFG["stale_days"])
     cars, duplicates = merge_duplicates(cars, args.db)
     groups = build_groups(cars, min_n)
-    series = model_series(cars, max(3, min_n))
     sold = sold_summary(cars, groups)
 
     pooled = None
@@ -1868,7 +1753,7 @@ def main():
     fitted = [g for g in glist if g["fit"]]
     errs = [g["err"] for g in glist]     # whichever baseline each group actually uses
     payload = {
-        "cols": cols, "cars": packed, "groups": glist, "series": series,
+        "cols": cols, "cars": packed, "groups": glist,
         "meta": {
             "cars": len(cars), "groups": len(glist),
             "gen_groups": sum(1 for g in glist if g["is_gen"]),
