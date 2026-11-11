@@ -226,3 +226,17 @@ def test_make_catalogue_sync_has_no_duplicates(store):
     assert db.sync_catalogue(entries, ag.catalogue_url) == (1, 0)
     assert [u for u, _, _ in db.pending_models(7, False)] == [ag.make_url("BMW")]
     assert db.models_missing_ids() == 0      # makes have no ids by design
+
+
+def test_newest_url_is_the_sites_newest_first_sort(page):
+    # On autogidas "naujausi_asc" is "Naujausi viršuje" (newest first) and
+    # "naujausi_desc" is "Seniausi viršuje" (oldest first). The saved page was
+    # fetched with _desc: the watcher must refuse to walk it.
+    html = page("autogidas/results_newest.html")
+    assert '<option value="?f_50=naujausi_asc">Naujausi viršuje' in html
+    assert ag.newest_url.endswith("f_50=naujausi_asc")
+    assert ag.is_newest_first(html) is False
+    assert ag.is_newest_first(html.replace(
+        '"?f_50=naujausi_desc" selected="selected"', '"?f_50=naujausi_desc"').replace(
+        '"?f_50=naujausi_asc"', '"?f_50=naujausi_asc" selected="selected"')) is True
+    assert ag.is_newest_first("<html>no sort box</html>") is None

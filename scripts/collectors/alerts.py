@@ -58,18 +58,27 @@ def send(text, config=None, post=None):
         return False
 
 
-def deal_message(source, title, year, price, mid, lo, link, also=None):
+def deal_message(source, title, year, price, mid, lo, link, also=None, similar=None,
+                 verdict="deal"):
+    """`similar`: (similar cars in the database, how many are cheaper, their median).
+    A "maybe" (too few similar cars to confirm) is announced as a possible deal."""
     under = round((lo - price) / lo * 100) if lo else 0
-    text = (f"Deal on {source}: {title} {year or ''} for €{price:,}\n"
-            f"Expected €{mid:,.0f}; {under}% under the low end of its range.\n{link}")
+    what = "Deal" if verdict == "deal" else "Possible deal"
+    text = (f"{what} on {source}: {title} {year or ''} for €{price:,}\n"
+            f"Expected €{mid:,.0f}; {under}% under the low end of its range.\n")
+    if similar and similar[0]:
+        n, cheaper, median = similar
+        text += f"Cheaper than {n - cheaper} of {n} similar cars (their median €{median:,}).\n"
+    text += link
     if also:
         text += f"\nAlso on {also['source']} for €{also['price_eur']:,}: {also['link']}"
     return text
 
 
-def deal_alert(source, title, year, price, mid, lo, link, also=None):
+def deal_alert(source, title, year, price, mid, lo, link, also=None, similar=None,
+               verdict="deal"):
     if SETTINGS["alerts"]["deals"]:
-        send(deal_message(source, title, year, price, mid, lo, link, also))
+        send(deal_message(source, title, year, price, mid, lo, link, also, similar, verdict))
 
 
 def failure_alert(source, failures):

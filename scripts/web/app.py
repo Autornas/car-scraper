@@ -7,7 +7,7 @@ control area for admins.
     /report       the report: admins get the full copy, viewers the viewer copy
     /admin        the control page (admins)
     /api/me       who you are
-    /api/status, /api/models, /api/action     admin only
+    /api/status, /api/models, /api/watchlist, /api/action     admin only
 
 Every request is identified first (web/auth.py); admin pages and every
 admin API refuse viewers on the server, whatever the page shows. Changes
@@ -19,6 +19,7 @@ Run it with:  python scripts/scraper_dashboard.py
 
 import json
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -26,6 +27,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+import backup
 from settings import SETTINGS
 from web import admin
 from web.auth import Authenticator, AuthError, User
@@ -48,10 +50,11 @@ SECURITY_HEADERS = {
 }
 NO_REPORT = """<!doctype html><meta charset="utf-8"><title>No report yet</title>
 <body style="font:15px system-ui;padding:40px;color:#444">The price report hasn't been built
-yet. An admin can build it from the control page (Rebuild report).</body>"""
+yet. An admin can build it from the control page (Update database).</body>"""
 
 
-def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watcher=False):
+def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watcher=False,
+               start_backups=False):
     auth = authenticator or Authenticator(settings["web"])
     managers = managers or {"jobs": admin.JobManager(), "watcher": admin.JobManager()}
 
@@ -59,7 +62,13 @@ def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watch
     async def lifespan(_app):
         if start_watcher:
             print(managers["watcher"].start("start_watcher")[1], flush=True)
+        stop_backups = threading.Event()
+        if start_backups and backup.backup_dir() is not None:
+            # checks every half hour whether a backup is due ([backup] every_days)
+            threading.Thread(target=backup.run_forever, args=(stop_backups,),
+                             daemon=True, name="backups").start()
         yield
+        stop_backups.set()
         for manager in managers.values():           # never leave a scraper running
             task, _ = manager.snapshot()
             if task and task["status"] == "running":
@@ -128,9 +137,11 @@ def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watch
         task, logs = managers["jobs"].snapshot()
         watcher_task, watcher_logs = managers["watcher"].snapshot()
         return JSONResponse({
-            "task": task, "logs": logs[-150:],
-            "watcher_task": watcher_task, "watcher_logs": watcher_logs[-150:],
+            "task": task, "logs": logs[-500:],
+            "watcher_task": watcher_task, "watcher_logs": watcher_logs[-500:],
+            "sites": [site.SOURCE for site in admin.enabled_sites()],
             "database": admin.database_summary(),
+            "backup": backup.status(),
             "report_exists": admin.REPORT_PATH.exists(),
             "audit": admin.recent_audit(),
             "user": {"email": current.email, "role": current.role},
@@ -149,6 +160,10 @@ def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watch
             connection.close()
         return {"text": "\n".join(f"{mk}/{md}" for mk, md in rows), "count": len(rows)}
 
+    @app.get("/api/watchlist")
+    def get_watchlist(_: User = Depends(admin_only)):
+        return JSONResponse(admin.watchlist_state(), headers={"Cache-Control": "no-store"})
+
     @app.post("/api/action")
     async def action(request: Request, current: User = Depends(admin_only)):
         payload = await read_json(request)
@@ -162,6 +177,13 @@ def create_app(settings=SETTINGS, authenticator=None, managers=None, start_watch
                 raise HTTPException(400, str(exc)) from None
             admin.audit(current.email, "model list", message)
             return {"ok": True, "message": message, "text": text, "count": count}
+        if name == "save_watchlist":
+            try:
+                wanted, message = admin.save_watchlist(payload)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
+            admin.audit(current.email, "watchlist", admin.watchlist.describe(wanted))
+            return {"ok": True, "message": message, **admin.watchlist_state(wanted)}
         if name == "label":
             try:
                 message = admin.save_label(payload)

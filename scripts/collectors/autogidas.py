@@ -10,8 +10,9 @@ How it differs from Autoplius, and what that means here:
     "Mercedes-Benz C 220 T CDI" lands under mercedes-benz/c220 like the same
     car on Autoplius. See MAKE_SEARCH and collectors.crawl.
   * Filters go by name: f_1[0]=BMW (make), f_215 / f_216 (price from / to),
-    f_46=<defect> (one defect type per search), f_50=naujausi_desc (newest
-    first), page=N. Pages past the end wrap back to page 1.
+    f_46=<defect> (one defect type per search), f_50=naujausi_asc (newest
+    first: the site's "_desc" value is its OLDEST-first sort), page=N. Pages
+    past the end wrap back to page 1.
   * Cards carry no body type; the ad URL does ("...-2006-m-vienaturis-...").
 
 The hooks the shared crawler and watcher call are listed in
@@ -99,7 +100,19 @@ def make_url(make_name):
     return f"{SEARCH}?f_1%5B0%5D={quote(make_name)}"
 
 
-newest_url = f"{SEARCH}?f_50=naujausi_desc"
+# "Naujausi viršuje" (newest first) is f_50=naujausi_asc on this site;
+# naujausi_desc is "Seniausi viršuje" (oldest first). The watcher ran on _desc
+# for a day and saw no new ad at all, so is_newest_first() now checks the
+# page itself.
+NEWEST_SORT = "naujausi_asc"
+newest_url = f"{SEARCH}?f_50={NEWEST_SORT}"
+
+
+def is_newest_first(html):
+    """Whether a results page really is sorted newest first, read from its own
+    sort box. None when the page has no sort box to tell by."""
+    selected = re.search(r'<option value="\?f_50=([a-z_]+)"\s+selected', html or "")
+    return selected.group(1) == NEWEST_SORT if selected else None
 
 
 def damaged_search_urls():

@@ -160,3 +160,72 @@ def test_health_reports_failures_and_staleness():
 
 def test_health_without_tables_is_none():
     assert w.health(sqlite3.connect(":memory:"), "autoplius") is None
+
+
+# --------------------------------------------------------------------------- #
+# the list must really be newest-first
+# --------------------------------------------------------------------------- #
+def test_walk_fails_when_the_site_serves_another_sort_order():
+    class Site:
+        scrape_page = staticmethod(db.scrape_page)
+        card_ages = staticmethod(db.card_ages)
+        is_newest_first = staticmethod(lambda html: False)
+
+    result = w.walk(Site, lambda n: results_page(["10", "11"]), lambda i: False)
+    assert result["failed"] and result["wrong_sort"]
+    assert result["pages"] == 0 and not result["rows"]      # nothing stored from it
+
+
+# --------------------------------------------------------------------------- #
+# cheap next to similar cars?
+# --------------------------------------------------------------------------- #
+SIMILAR = [5000, 5500, 6000, 6200, 6500, 7000, 7500, 8000]
+
+
+def test_market_check_confirms_a_car_in_the_cheapest_quarter():
+    assert w.market_check(4800, SIMILAR) == ("cheap", 8, 0, 6350)
+    assert w.market_check(5400, SIMILAR)[0] == "cheap"          # 1 of 8 cheaper
+
+
+def test_market_check_rejects_what_the_neighbours_undercut():
+    # the price model said "under its range"; 5 of 8 similar cars cost less
+    assert w.market_check(6400, SIMILAR) == ("not cheap", 8, 4, 6350)
+    # cheapest of all, but only 3% under the median: not a deal either
+    assert w.market_check(6150, [6200, 6300, 6350, 6400, 6500])[0] == "not cheap"
+
+
+def test_market_check_cannot_tell_from_a_few_cars():
+    assert w.market_check(3000, [5000, 6000]) == ("few", 2, 0, 5500)
+    assert w.market_check(3000, []) == ("few", 0, 0, None)
+
+
+def test_similar_prices_match_model_year_mileage_and_skip_damaged(tmp_path):
+    from collectors.store import Store
+    store = Store(tmp_path / "t.db")
+    site = store.site("autoplius")
+
+    def car(ad_id, year, km, price, fuel="Dyzelinas"):
+        return {"id": ad_id, "title": "BMW 320", "year": year, "price_eur": price,
+                "mileage_km": km, "fuel": fuel, "engine_l": "2.0", "link": f"https://x/{ad_id}"}
+    site.upsert_many([car("1", 2015, 200_000, 9000), car("2", 2016, 210_000, 9500),
+                      car("3", 2014, 190_000, 8500), car("4", 2015, 400_000, 4000),   # mileage
+                      car("5", 2010, 200_000, 3000),                                  # year
+                      car("6", 2015, 205_000, 2000),                                  # damaged
+                      car("7", 2015, 200_000, 9900, "Benzinas")], "bmw", "320")
+    store.conn.execute("UPDATE listings SET damaged = 1 WHERE id = '6'")
+    target = {"make": "bmw", "model": "320", "year": 2015, "mileage_km": 200_000,
+              "fuel": "Dyzelinas"}
+    prices = w.similar_prices(store.conn, "autoplius", "1", target, min_n=2)
+    assert sorted(prices) == [8500, 9500]              # itself, 4, 5, 6 and the petrol out
+    # too few diesels for min_n: every fuel counts
+    assert sorted(w.similar_prices(store.conn, "autoplius", "1", target, min_n=3)) == \
+        [8500, 9500, 9900]
+    store.close()
+
+
+def test_new_deals_table_gains_the_similar_columns():
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE new_deals (source TEXT, id TEXT, found_at TEXT, verdict TEXT)")
+    w.ensure_tables(con)
+    columns = {r[1] for r in con.execute("PRAGMA table_info(new_deals)")}
+    assert {"also", "similar_n", "similar_cheaper", "similar_median"} <= columns

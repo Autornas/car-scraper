@@ -157,17 +157,18 @@ def test_admin_gets_the_full_report(site):
     assert "viewer report" in home and 'href="/admin"' in home
 
 
-@pytest.mark.parametrize("path", ["/admin", "/api/status", "/api/models"])
+@pytest.mark.parametrize("path", ["/admin", "/api/status", "/api/models", "/api/watchlist"])
 def test_viewer_cannot_open_admin_pages(site, path):
     client, _ = site
     assert client.get(path, headers=as_user(VIEWER)).status_code == 403
 
 
 @pytest.mark.parametrize("payload", [
-    {"action": "start_database"}, {"action": "rescrape_all"}, {"action": "stop"},
+    {"action": "update"}, {"action": "rescrape_all"}, {"action": "stop"},
     {"action": "start_watcher"}, {"action": "stop_watcher"},
     {"action": "label", "source": "autoplius", "id": "1", "label": "deal"},
     {"action": "save_database_models", "text": "bmw/320\n"},
+    {"action": "save_watchlist", "makes": "bmw"},
 ])
 def test_viewer_cannot_change_anything_even_calling_the_api(site, payload):
     client, managers = site
@@ -181,14 +182,36 @@ def test_viewer_cannot_change_anything_even_calling_the_api(site, payload):
 # --------------------------------------------------------------------------- #
 def test_admin_starts_tasks_and_the_watcher_separately(site):
     client, managers = site
-    assert post(client, {"action": "start_database"}).status_code == 202
+    assert post(client, {"action": "update"}).status_code == 202
     assert post(client, {"action": "start_watcher"}).status_code == 202
     assert post(client, {"action": "stop_watcher"}).status_code == 200
-    assert managers["jobs"].calls == [("start", "start_database")]
+    assert managers["jobs"].calls == [("start", "update")]
     assert managers["watcher"].calls == [("start", "start_watcher"), ("stop",)]
     actions = [a["action"] for a in admin.recent_audit()]
     assert actions == ["stop", "start", "start"]
     assert all(a["email"] == ADMIN for a in admin.recent_audit())
+
+
+def test_admin_saves_the_watchlist(site, tmp_path, monkeypatch):
+    client, _ = site
+    monkeypatch.setattr(alerts, "SECRETS_PATH", tmp_path / "no-secrets.toml")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    assert client.get("/api/watchlist", headers=as_user(ADMIN)).json()["watchlist"]["makes"] == []
+    r = post(client, {"action": "save_watchlist", "makes": "BMW, Audi A4", "price_max": 15000,
+                      "min_discount": 20, "include_maybe": True})
+    assert r.status_code == 200, r.text
+    saved = r.json()["watchlist"]
+    assert saved["makes"] == ["bmw", "audi-a4"]       # an empty catalogue: nothing to check
+    assert saved["price_max"] == 15000 and saved["include_maybe"] is True
+    assert client.get("/api/watchlist", headers=as_user(ADMIN)).json()["watchlist"] == saved
+    assert admin.recent_audit()[0]["action"] == "watchlist"
+    # nonsense is refused with the reason, and nothing changes
+    bad = post(client, {"action": "save_watchlist", "price_min": 9000, "price_max": 100})
+    assert bad.status_code == 400 and "higher" in bad.json()["message"]
+    assert client.get("/api/watchlist", headers=as_user(ADMIN)).json()["watchlist"] == saved
+    # cleared
+    cleared = post(client, {"action": "save_watchlist", "makes": ""})
+    assert "cleared" in cleared.json()["message"]
 
 
 def test_admin_labels_a_car(site):
@@ -201,13 +224,13 @@ def test_admin_labels_a_car(site):
 @pytest.mark.parametrize("origin", [None, "https://evil.example.com", "http://deals.example.com.evil.io"])
 def test_changes_must_come_from_this_sites_pages(site, origin):
     client, managers = site
-    assert post(client, {"action": "start_database"}, origin=origin).status_code == 403
+    assert post(client, {"action": "update"}, origin=origin).status_code == 403
     assert managers["jobs"].calls == []
 
 
 def test_changes_must_be_json(site):
     client, _ = site
-    r = post(client, {"action": "start_database"}, content_type="text/plain")
+    r = post(client, {"action": "update"}, content_type="text/plain")
     assert r.status_code == 415
 
 

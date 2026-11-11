@@ -2,7 +2,7 @@
 """
 watch.py — catch every new ad within minutes (see collectors/watch.py).
 
-    python scripts/watch.py                # every enabled site, every 5 minutes
+    python scripts/watch.py                # every enabled site, every 3 minutes
     python scripts/watch.py --once         # one scan, then exit
     python scripts/watch.py --verify 6     # are the last 6 h of ads all stored?
     python scripts/watch.py --site autoplius
@@ -16,6 +16,7 @@ import requests
 
 from collectors import alerts, enabled_sites, get_site
 from collectors import watch as w
+from collectors.common import site_output
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
@@ -32,6 +33,10 @@ def main():
     ap.add_argument("--margin-pages", type=int, default=CFG["margin_pages"])
     ap.add_argument("--max-pages", type=int, default=CFG["max_pages"])
     ap.add_argument("--delay", type=float, default=CFG["delay"])
+    ap.add_argument("--min-similar", type=int, default=CFG["min_similar"],
+                    help="similar cars needed to confirm a deal; fewer = 'maybe'")
+    ap.add_argument("--min-discount", type=float, default=CFG["min_discount"],
+                    help="a deal is at least this share under similar cars' median")
     ap.add_argument("--no-read", dest="read_cheap_ads", action="store_false",
                     default=CFG["read_cheap_ads"], help="don't open the ads of cheap new cars")
     ap.add_argument("--once", action="store_true", help="run one scan and exit")
@@ -53,10 +58,16 @@ def main():
     try:
         if args.verify:
             for site in sites:
-                w.verify(site, session, watches[site.SOURCE], args.verify, args.delay)
+                with site_output(site.SOURCE):
+                    w.verify(site, session, watches[site.SOURCE], args.verify, args.delay)
             return
         model, compiled = w.load_scoring()
         model_mtime = w.model_mtime()
+        # Earlier finds, judged again with today's rules and today's database.
+        with store.lock:
+            changed = w.recheck_deals(store.conn, args.min_similar, args.min_discount)
+        if changed:
+            print(f"Re-checked the earlier deals: {changed} got a different verdict.")
         print(f"Watching {', '.join(s.SOURCE for s in sites)} every "
               f"{args.interval_minutes:g} min (stop after {args.margin_pages + 1} fully "
               f"known page(s), cap {args.max_pages} pages).")
@@ -69,14 +80,16 @@ def main():
                 model, compiled = w.load_scoring()
                 model_mtime = w.model_mtime()
             for site in sites:
-                try:
-                    result = w.scan(site, session, store, watches[site.SOURCE], model,
-                                    compiled, args)
-                    failed = result["failed"] and not result["pages"]
-                except requests.RequestException as exc:
-                    print(f"  ! {site.SOURCE} scan failed: {exc}", file=sys.stderr)
-                    failed = True
-                # one alert when a site starts failing, not one every 5 minutes
+                # every line of a site's scan starts with "[site] "
+                with site_output(site.SOURCE):
+                    try:
+                        result = w.scan(site, session, store, watches[site.SOURCE], model,
+                                        compiled, args)
+                        failed = result["failed"] and not result["pages"]
+                    except requests.RequestException as exc:
+                        print(f"  ! scan failed: {exc}", file=sys.stderr)
+                        failed = True
+                # one alert when a site starts failing, not one every scan
                 failures[site.SOURCE] = failures[site.SOURCE] + 1 if failed else 0
                 if failures[site.SOURCE] == FAILURE_ALERT_AFTER:
                     alerts.failure_alert(site.SOURCE, failures[site.SOURCE])

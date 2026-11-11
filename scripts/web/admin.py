@@ -18,9 +18,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from collectors import SITES, enabled_sites
+from collectors import SITES, alerts, enabled_sites, watchlist
 from collectors.verdicts import LABELS, set_label
 from collectors.store import Store
+from collectors.watch import ensure_tables as ensure_watch_tables
 from collectors.watch import health as watcher_health
 
 from settings import SETTINGS, project_path
@@ -40,20 +41,31 @@ def _script(name, *args):
 
 # action -> (task name shown in the dashboard, [command, command, ...]).
 # Commands run one after another; a failed or stopped step ends the task.
+# update.py is the whole routine in one task: both sites scraped at the same
+# time, damage sweep, the best candidates' ads read, report rebuilt. The
+# separate damage / candidate tasks it replaced were steps of it anyway.
 TASKS = {
     "start_watcher": ("watcher", [
         _script("watch.py")]),
-    "start_database": ("database scraper", [_script("scrape.py")]),
-    "rescrape_all": ("full re-scrape", [_script("scrape.py", "--force")]),
-    "refresh_damage": ("damage check", [_script("scrape.py", "--damage-sweep")]),
-    "check_candidates": ("candidate check", [
-        _script("autoplius_stats.py"),
-        _script("scrape.py", "--backfill-descriptions",
-                "--ids-file", str(CANDIDATES_PATH)),
-        _script("autoplius_stats.py"),
-    ]),
+    "update": ("update", [_script("update.py")]),
+    "rescrape_all": ("full re-scrape", [_script("update.py", "--force")]),
     "build_report": ("report build", [_script("autoplius_stats.py")]),
 }
+
+# Scrapers start every line with "[site] " (collectors.common.site_output).
+SITE_LINE_RE = re.compile(r"\s*\[(\w+)\] (.*)", re.S)
+# A site saying no, or a scan that got nothing ...
+PROBLEM_RE = re.compile(
+    r"HTTP (401|403|429|5\d\d)|refus|challenge|captcha|no response|not a results page"
+    r"|could be read|cut short|newest-first|ConnectionError|Timeout|slow down"
+    r"|request failure|is not an ad page", re.I)
+# ... and a line that proves the site is answering again.
+WORKING_RE = re.compile(
+    r"\d+ new ad\(s\)|\d+ listing\(s\)|no listings|description saved|no description"
+    r"|Damage sweep: \d+|Catalogue: \d+", re.I)
+# Lines after a problem before a site counts as fine again without such proof.
+CLEAR_AFTER = 4
+REFUSED_HOSTS = {"autoplius.lt", "autogidas.lt"}
 
 
 def _spawn(command):
@@ -77,7 +89,7 @@ def _describe(command):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Autoplius dashboard</title>
+<title>Car scraper</title>
 <style>
 :root{color-scheme:light;--bg:#f6f6f4;--panel:#fff;--panel-2:#f0f0ed;--line:#dcdcd8;--text:#111;
  --muted:#6d6c68;--accent:#2a78d6;--ok:#0b8a0b;--bad:#c93c3c;--warn:#b86a12;--log:#fbfbfa}
@@ -129,8 +141,22 @@ main{flex:1;min-height:0;display:flex}
 .task .d{font-size:12px;color:var(--muted)}
 .task.running{background:color-mix(in srgb,var(--ok) 9%,transparent)}
 .task.running .n::after{content:" · running";color:var(--ok);font-weight:500}
+details.more{border-top:1px solid var(--line)}
+details.more summary{cursor:pointer;padding:9px 14px;font-size:13px;color:var(--muted);user-select:none}
+details.more[open] summary{border-bottom:1px solid var(--line)}
 .right{min-height:0;display:flex;flex-direction:column;gap:12px}
 .log{flex:1;min-height:0;display:flex;flex-direction:column}
+/* one output pane per site, side by side: who printed it is never in doubt */
+.panes{flex:1;min-height:0;display:flex}
+.pane{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
+.pane+.pane{border-left:1px solid var(--line)}
+.pane .ph{display:flex;align-items:baseline;gap:8px;padding:7px 14px;border-bottom:1px solid var(--line);
+ font-size:13px;flex-wrap:wrap}
+.pane .ph b{font-weight:650}
+.pane .st{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.pane .st.ok{color:var(--ok)}.pane .st.bad{color:var(--bad);font-weight:600}
+.pane pre{border-radius:0}.pane:first-child pre{border-bottom-left-radius:10px}
+.pane:last-child pre{border-bottom-right-radius:10px}
 .logtabs{display:flex;gap:2px;text-transform:none;letter-spacing:0}
 .logtabs button{padding:2px 9px;font-size:12px;font-weight:500}
 .logtabs button.on{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -145,14 +171,11 @@ main{flex:1;min-height:0;display:flex}
 .deal .t{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .deal .m{grid-column:1/-1;font-size:12px;color:var(--muted)}
 .deal .p{font-variant-numeric:tabular-nums;font-weight:650}
-.deal .lb{grid-column:1/-1;display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
-.deal .lb button{font-size:12px;padding:2px 8px;font-weight:500}
-.deal .lb button.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.v.you{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
 .v{font-size:11px;font-weight:650;padding:1px 7px;border-radius:99px;white-space:nowrap}
 .v.deal{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
 .v.damaged,.v.problem{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
 .v.other{background:var(--panel-2);color:var(--muted)}
+.v.maybe{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
 .empty{padding:14px;color:var(--muted);font-size:13px}
 .health.bad{color:var(--bad);font-weight:600}.health.ok{color:var(--ok)}
 .log h2 .spacer{flex:1}
@@ -172,6 +195,19 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
  border:1px solid var(--line);border-radius:10px;padding:12px;font:13px/1.5 ui-monospace,Consolas,monospace}
 .models p{margin:0;color:var(--muted);font-size:13px}
 .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+/* watchlist view */
+.watchlist{display:flex;flex-direction:column;gap:14px;max-width:900px;overflow:auto}
+.watchlist p{margin:0;color:var(--muted);font-size:13px}
+.field{display:flex;flex-direction:column;gap:4px;font-size:13px;font-weight:600}
+.field small,.watchlist small{font-weight:400;color:var(--muted);font-size:12px}
+.field input{font:inherit;font-weight:400;padding:8px 10px;border-radius:7px;border:1px solid var(--line);
+ background:var(--panel);color:var(--text);min-width:0}
+.field input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;align-items:end}
+.check{display:flex;align-items:center;gap:8px;font-size:13px}
+.backupline{padding:7px 14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.backupline.bad{color:var(--bad);font-weight:600}
+.deal .star{color:var(--warn)}
 .ok{color:var(--ok)}.error{color:var(--bad)}
 #alert{position:fixed;bottom:16px;right:16px;z-index:10;max-width:min(480px,calc(100vw - 32px));
  padding:12px 40px 12px 14px;background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--bad);
@@ -185,7 +221,9 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
  main{display:block}
  .control{display:flex;flex-direction:column}
  .col{overflow:visible}
- .log{height:60vh;flex:none}
+ .log{height:auto;flex:none}
+ .panes{flex-direction:column}.pane{height:45vh;flex:none}
+ .pane+.pane{border-left:0;border-top:1px solid var(--line)}
  .report{height:calc(100vh - 100px)}
  .stats{grid-template-columns:repeat(2,1fr)}
  .stat:nth-child(3n){border-right:1px solid var(--line)}.stat:nth-child(2n){border-right:0}
@@ -194,14 +232,15 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 </style></head>
 <body>
 <header class="top">
- <span class="brand">Autoplius</span>
+ <span class="brand">Car scraper</span>
  <nav class="nav" aria-label="Sections">
   <button data-view="control" aria-current="page">Control</button>
   <button data-view="report">Deals &amp; prices</button>
+  <button data-view="watchlist">Watchlist</button>
   <button data-view="models">Models</button>
  </nav>
  <span class="spacer"></span>
- <span class="bar" id="reportTools" hidden><button id="reloadReport" title="Load the latest built report (Rebuild report on the Control page builds a new one)">Reload report</button>
+ <span class="bar" id="reportTools" hidden><button id="reloadReport" title="Load the latest built report (Update database on the Control page builds a new one)">Reload report</button>
   <a href="/report" target="_blank" rel="noreferrer">Open in new tab</a></span>
  <span class="chip" id="chip"><span class="dot"></span><span id="chipText">Connecting…</span></span>
  <button class="danger" id="stopButton" hidden>Stop task</button>
@@ -219,55 +258,44 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
     <div class="stat"><div class="v" id="sModels">—</div><div class="l">models scraped</div></div>
     <div class="stat"><div class="v" id="sLast">—</div><div class="l">last model scraped</div></div>
     <div class="stat"><div class="v" id="sDamaged">—</div><div class="l" id="sDamagedL">damaged flagged</div></div>
-    <div class="stat"><div class="v" id="sPower">—</div><div class="l">have kW / gearbox</div></div>
-    <div class="stat"><div class="v" id="sDesc">—</div><div class="l">descriptions read</div></div>
-    <div class="stat"><div class="v" id="sCand">—</div><div class="l">candidates to read</div></div>
     <div class="stat"><div class="v" id="sNew">—</div><div class="l">new ads, last 24 h</div></div>
     <div class="stat"><div class="v" id="sReport">—</div><div class="l">report built</div></div>
    </div>
+   <div class="backupline" id="backupLine"></div>
   </div>
   <div class="card">
-   <h2>Tasks <span class="spacer"></span><span id="notice" style="text-transform:none;letter-spacing:0"></span></h2>
-   <div class="group-label">Live</div>
+   <h2>Scrapers <span class="spacer"></span><span id="notice" style="text-transform:none;letter-spacing:0"></span></h2>
    <div class="task" data-task="watcher"><div class="t"><div class="n">New-listing watcher</div>
-    <div class="d">Reads each site's newest ads every 5 minutes until it reaches ones it already has, prices them and checks cheap ones for defects. Runs alongside tasks.</div>
+    <div class="d">Reads each site's newest ads every 3 minutes, prices them, and opens the cheap ones to check for defects.</div>
     <div class="d health" id="watchHealth"></div></div>
     <button data-action="start_watcher">Start</button></div>
-   <div class="group-label">Collect</div>
-   <div class="task" data-task="database scraper"><div class="t"><div class="n">Resume scraping</div>
-    <div class="d">Every model (Autoplius) or make (autogidas) not scraped in the last 7 days, then each site's damage sweep.</div></div>
-    <button data-action="start_database">Start</button></div>
-   <div class="task" data-task="full re-scrape"><div class="t"><div class="n">Full re-scrape</div>
-    <div class="d">Every model again, regardless of age — refreshes every price and car detail. About 4 hours at a polite pace.</div></div>
-    <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes about 4 hours.">Start</button></div>
-   <div class="group-label">Clean up</div>
-   <div class="task" data-task="damage check"><div class="t"><div class="n">Flag damaged cars</div>
-    <div class="d">Each site's own defect filter (Autoplius ~120 pages, autogidas ~40 pages). ~5–10 min.</div></div>
-    <button data-action="refresh_damage">Start</button></div>
-   <div class="task" data-task="candidate check"><div class="t"><div class="n">Check top candidates</div>
-    <div class="d">Rebuilds the deal list, reads the 300 best unread ads for defects, rebuilds again. ~15 min.</div></div>
-    <button data-action="check_candidates">Start</button></div>
-   <div class="group-label">Report</div>
-   <div class="task" data-task="report build"><div class="t"><div class="n">Rebuild report</div>
-    <div class="d">Refits the price model and refreshes the deal list. ~30 s.</div></div>
-    <button data-action="build_report">Start</button></div>
-   <div style="height:6px"></div>
+   <div class="task" data-task="update"><div class="t"><div class="n">Update database</div>
+    <div class="d">Everything in one go: scrapes what is due on both sites at the same time, flags damaged cars, reads the best candidates' ads and rebuilds the report. Stop any time; the next run resumes.</div></div>
+    <button class="primary" data-action="update">Start</button></div>
+   <details class="more"><summary>More</summary>
+    <div class="task" data-task="full re-scrape"><div class="t"><div class="n">Full re-scrape</div>
+     <div class="d">The same update, but every model again regardless of age. Several hours.</div></div>
+     <button data-action="rescrape_all" data-confirm="Re-scrape every model? This takes several hours.">Start</button></div>
+    <div class="task" data-task="report build"><div class="t"><div class="n">Rebuild report only</div>
+     <div class="d">Refits the price model and refreshes the deal list without scraping. ~30 s.</div></div>
+     <button data-action="build_report">Start</button></div>
+    <div class="group-label">Recent actions</div>
+    <div class="auditlist" id="audit"><div class="muted">Nothing yet.</div></div>
+   </details>
   </div>
-  <div class="card"><h2>Recent actions</h2><div class="auditlist" id="audit">
-   <div class="muted">Nothing yet.</div></div></div>
-  <p style="margin:0;font-size:12px;color:var(--muted)">The watcher runs alongside one task at a time. Stopping is safe: finished pages are saved and the next run resumes. If Autoplius refuses requests, the refused page opens in your browser — wait before resuming.</p>
  </div>
  <div class="right">
  <div class="card deals">
-  <h2>New deals <span class="spacer"></span><span id="dealsNote" style="text-transform:none;letter-spacing:0"></span></h2>
+  <h2>New deals <span class="logtabs"><button id="watchOnly" hidden title="Show only the cars that fit your watchlist">★ Watchlist only</button></span>
+   <span class="spacer"></span><span id="dealsNote" style="text-transform:none;letter-spacing:0"></span></h2>
   <div class="list" id="deals"><div class="empty">Cars the watcher finds under their price range appear here.</div></div>
  </div>
  <div class="card log">
   <h2><span id="logTitle">Output</span>
-   <span class="logtabs"><button id="logJob" class="on">Task</button><button id="logWatcher">Watcher</button></span>
+   <span class="logtabs"><button id="logJob" class="on">Update</button><button id="logWatcher">Watcher</button></span>
    <span class="spacer"></span>
    <label><input type="checkbox" id="follow" checked> Follow output</label></h2>
-  <pre id="logs">No task started yet.</pre>
+  <div class="panes" id="panes"></div>
  </div>
  </div>
 </section>
@@ -275,7 +303,27 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 <section class="view report" id="v-report" hidden>
   <iframe id="reportFrame" title="Deals and price analysis"></iframe>
  <div class="overlay" id="reportOverlay"><strong>Loading report…</strong>
-  <span>The report is about 2 MB; it is rebuilt by the Rebuild report task and every night.</span></div>
+  <span>The report is about 2 MB; it is rebuilt by every update and every night.</span></div>
+</section>
+
+<section class="view watchlist" id="v-watchlist" hidden>
+ <p>Say which new deals matter to you. Cars that fit get a ★ in New deals (with a <b>Watchlist only</b> filter there), and Telegram alerts are sent only for them. Leave everything empty to be told about every confirmed deal.</p>
+ <label class="field">Makes and models
+  <input id="wlMakes" type="text" spellcheck="false" placeholder="bmw, audi a4, volkswagen/passat">
+  <small>Separated by commas. A make alone means all its models. Empty = every make.</small></label>
+ <div class="fields">
+  <label class="field">Price from, €<input id="wlPriceMin" type="number" min="0" step="100" placeholder="any"></label>
+  <label class="field">Price to, €<input id="wlPriceMax" type="number" min="0" step="100" placeholder="any"></label>
+  <label class="field">Year from<input id="wlYearMin" type="number" min="0" max="2100" placeholder="any"></label>
+  <label class="field">Mileage up to, km<input id="wlKmMax" type="number" min="0" step="10000" placeholder="any"></label>
+  <label class="field">At least % under the typical price<input id="wlDiscount" type="number" min="0" max="90" placeholder="any"></label>
+ </div>
+ <p><small>The typical price is the median of similar cars in the database (same model, year ±1, mileage ±30%), or the price model's expected price when there are fewer than 5 of them.</small></p>
+ <label class="check"><input type="checkbox" id="wlMaybe"> Also alert for “maybe” cars (too few similar cars to confirm the deal)</label>
+ <div class="bar"><button class="primary" id="saveWatchlist">Save watchlist</button>
+  <button id="clearWatchlist">Clear</button>
+  <span id="wlStatus" style="color:var(--muted)"></span></div>
+ <p id="wlTelegram"></p>
 </section>
 
 <section class="view models" id="v-models" hidden>
@@ -290,7 +338,7 @@ pre .e{color:var(--bad)}pre .s{color:var(--accent);font-weight:600}
 
 <aside id="alert" role="alert" hidden><button id="alertClose" aria-label="Dismiss">×</button>
  <div id="alertTitle"></div><div id="alertMessage"></div>
- <a id="alertLink" target="_blank" rel="noreferrer" hidden>Open the refused Autoplius page</a></aside>
+ <a id="alertLink" target="_blank" rel="noreferrer" hidden>Open the refused page</a></aside>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -305,11 +353,12 @@ function ago(iso){
 
 /* ---------- views ---------- */
 let reportLoaded=false;
+const VIEWS=["control","report","watchlist","models"];
 function showView(view){
- if(!["control","report","models"].includes(view))view="control";
+ if(!VIEWS.includes(view))view="control";
  document.querySelectorAll(".nav button").forEach(b=>b.toggleAttribute("aria-current",b.dataset.view===view));
  document.querySelectorAll(".nav button[aria-current]").forEach(b=>b.setAttribute("aria-current","page"));
- ["control","report","models"].forEach(v=>$("v-"+v).hidden=v!==view);
+ VIEWS.forEach(v=>$("v-"+v).hidden=v!==view);
  $("reportTools").hidden=view!=="report";
  if(view==="report"&&!reportLoaded)loadReport();
  history.replaceState(null,"","#"+view);
@@ -379,26 +428,100 @@ $("saveModels").addEventListener("click",async()=>{
  finally{$("saveModels").disabled=false;}
 });
 
-/* ---------- status ---------- */
-const ERR=/traceback|error|failed|http (4|5)\d\d|refus|challenge/i;
-let lastLog="";
-function renderLog(lines){
- const text=lines.join("");
- if(text===lastLog)return;lastLog=text;
- const pre=$("logs");
- pre.innerHTML=lines.length?lines.map(l=>{
-  const cls=l.startsWith("▶")||l.startsWith("\n▶")?"s":ERR.test(l)?"e":"";
-  return cls?`<span class="${cls}">${esc(l)}</span>`:esc(l);
- }).join(""):"No task started yet.";
- if($("follow").checked)pre.scrollTop=pre.scrollHeight;
+/* ---------- watchlist ---------- */
+const WL_FIELDS=[["wlPriceMin","price_min"],["wlPriceMax","price_max"],["wlYearMin","year_min"],
+ ["wlKmMax","km_max"],["wlDiscount","min_discount"]];
+function fillWatchlist(j){
+ const w=j.watchlist;
+ $("wlMakes").value=w.makes.join(", ");
+ for(const [id,key] of WL_FIELDS)$(id).value=w[key]||"";
+ $("wlMaybe").checked=!!w.include_maybe;
+ $("wlTelegram").textContent=!j.telegram
+  ?"Telegram is not set up on this PC yet, so for now the watchlist only marks cars in New deals. To get a message on your phone for each one, add a bot token to data/secrets.toml (README, “Telegram alerts”)."
+  :j.alerts_on?"Telegram is set up: you get a message for each new deal that fits."
+  :"Telegram is set up, but deal alerts are switched off in config.toml ([alerts] deals).";
 }
-/* Untick "follow" automatically when you scroll up to read, re-tick at the bottom. */
-$("logs").addEventListener("scroll",()=>{
- const p=$("logs");$("follow").checked=p.scrollHeight-p.scrollTop-p.clientHeight<30;
+async function loadWatchlist(){
+ try{
+  const response=await fetch("/api/watchlist",{cache:"no-store"});
+  const result=await response.json();
+  if(!response.ok)throw Error(result.message||response.statusText);
+  fillWatchlist(result);
+ }catch(e){$("wlStatus").textContent="Could not load the watchlist: "+e;$("wlStatus").className="error";}
+}
+async function saveWatchlist(clear){
+ const body={action:"save_watchlist",makes:clear?"":$("wlMakes").value,include_maybe:!clear&&$("wlMaybe").checked};
+ for(const [id,key] of WL_FIELDS)body[key]=clear?0:(Number($(id).value)||0);
+ $("saveWatchlist").disabled=$("clearWatchlist").disabled=true;
+ try{
+  const response=await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const result=await response.json();
+  $("wlStatus").textContent=result.message||"";
+  $("wlStatus").className=response.ok?"ok":"error";
+  if(response.ok){fillWatchlist(result);refresh();}
+ }catch(e){$("wlStatus").textContent="Save failed: "+e;$("wlStatus").className="error";}
+ finally{$("saveWatchlist").disabled=$("clearWatchlist").disabled=false;}
+}
+$("saveWatchlist").addEventListener("click",()=>saveWatchlist(false));
+$("clearWatchlist").addEventListener("click",()=>saveWatchlist(true));
+/* "Watchlist only" on the New deals list; remembered in this browser. */
+let watchOnly=false;
+try{watchOnly=localStorage.getItem("watchOnly")==="1";}catch(e){}
+$("watchOnly").addEventListener("click",()=>{
+ watchOnly=!watchOnly;
+ try{localStorage.setItem("watchOnly",watchOnly?"1":"0");}catch(e){}
+ refresh();
 });
 
+/* ---------- output: one pane per site ---------- */
+const ERR=/traceback|error|failed|http (4|5)\d\d|refus|challenge|cut short|no response/i;
+const TAG=/^(\s*)\[(\w+)\] /;
+let SITES=[],lastLog="";
+function buildPanes(sites){
+ if(sites.join()===SITES.join())return;
+ SITES=sites;lastLog="";
+ $("panes").innerHTML=sites.map(s=>`<div class="pane" data-site="${esc(s)}">
+  <div class="ph"><b>${esc(s)}</b><span class="st"></span></div><pre>Nothing yet.</pre></div>`).join("");
+ /* Untick "follow" when you scroll up to read, re-tick at the bottom. */
+ $("panes").querySelectorAll("pre").forEach(p=>p.addEventListener("scroll",()=>{
+  $("follow").checked=p.scrollHeight-p.scrollTop-p.clientHeight<30;}));
+}
+/* A site's pane shows its own lines (tag removed) plus the lines no site
+   owns: step headings, the report build. */
+function renderLogs(lines,status,idle){
+ const key=logSource+"\n"+lines.length+"\n"+(lines[lines.length-1]||"")+JSON.stringify(status||{});
+ if(key===lastLog)return;lastLog=key;
+ for(const pane of $("panes").children){
+  const site=pane.dataset.site,pre=pane.querySelector("pre"),st=pane.querySelector(".st");
+  const mine=[];
+  for(const l of lines){
+   const m=l.match(TAG);
+   if(m&&SITES.includes(m[2])){if(m[2]===site)mine.push([l.replace(TAG,"$1"),true]);}
+   else mine.push([l,false]);
+  }
+  pre.innerHTML=mine.length?mine.map(([l,own])=>{
+   const cls=l.startsWith("▶")||l.startsWith("\n▶")?"s":own&&ERR.test(l)?"e":"";
+   return cls?`<span class="${cls}">${esc(l)}</span>`:esc(l);
+  }).join(""):esc(idle);
+  if($("follow").checked)pre.scrollTop=pre.scrollHeight;
+  const info=(status||{})[site];
+  if(!info){st.textContent="no output yet";st.className="st";}
+  else if(info.state==="blocked"){
+   st.textContent=`problem ${ago(info.problem_at)}: ${info.problem.replace(/^!\s*/,"")}`;st.className="st bad";}
+  else{st.textContent=`answering · last line ${ago(info.at)}`
+   +(info.problem?` · earlier problem ${ago(info.problem_at)}`:"");st.className="st ok";}
+ }
+}
+
 /* ---------- watcher health and deals ---------- */
-const VERDICT={deal:"deal",damaged:"damaged",problem:"problem"};
+const VERDICT={deal:"deal",maybe:"maybe",damaged:"damaged",problem:"problem"};
+/* How the car compares with the similar cars in the database when it was found. */
+function similarText(d){
+ if(d.similar_n==null)return "";
+ if(!d.similar_n)return " · no similar cars in the database yet";
+ const t=`cheaper than ${d.similar_n-d.similar_cheaper} of ${d.similar_n} similar car${d.similar_n===1?"":"s"} (median €${fmt(d.similar_median)})`;
+ return " · "+(d.verdict==="maybe"?t+" — too few to be sure":t);
+}
 /* "site|price|link" -> " · also on autoplius €8,900 ↗" */
 function alsoText(also){
  if(!also)return "";
@@ -422,36 +545,20 @@ function renderWatcher(w,running){
  const lines=sites.map(([src,s])=>siteHealth(src,s,running));
  h.innerHTML=lines.map(([t,c])=>`<span class="${c}">${esc(t)}</span>`).join("<br>");
  h.className="d health";
- const deals=w.deals||[];
- $("dealsNote").textContent=deals.length?`${deals.filter(d=>d.verdict==="deal").length} deals of ${deals.length} recent`:"";
+ const only=watchOnly&&w.watchlist_set;
+ $("watchOnly").hidden=!w.watchlist_set;$("watchOnly").classList.toggle("on",!!only);
+ const deals=(only?w.watch_deals:w.deals)||[];
+ $("dealsNote").textContent=deals.length?`${deals.filter(d=>d.verdict==="deal").length} confirmed deals of ${deals.length} ${only?"on your watchlist":"recent"}`:"";
  $("deals").innerHTML=deals.length?deals.map(d=>{
   const under=d.lo?Math.round((d.lo-d.price)/d.lo*100):null;
   const cls=VERDICT[d.verdict]||"other";
-  return `<div class="deal"><span class="t">${esc(d.title)} ${d.year??""}</span>
+  return `<div class="deal"><span class="t">${d.watch?'<span class="star" title="Fits your watchlist">★</span> ':""}${esc(d.title)} ${d.year??""}</span>
    <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
    <span class="m">${esc(d.source)} · expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
-    d.flags?" · "+esc(d.flags.split("|").join(", ")):""}${alsoText(d.also)} · ${ago(d.found_at)} ·
-    <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span>
-   <span class="lb" data-source="${esc(d.source)}" data-id="${esc(d.id)}">Your verdict:${
-    Object.entries(LABEL_NAMES).map(([k,n])=>`<button data-label="${k}" class="${d.label===k?"on":""}">${n}</button>`).join("")}${
-    d.label?'<button data-label="">clear</button>':""}</span></div>`;
- }).join(""):'<div class="empty">No new car under its price range yet.</div>';
+    similarText(d)}${d.flags?" · "+esc(d.flags.split("|").join(", ")):""}${alsoText(d.also)} · ${ago(d.found_at)} ·
+    <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
+ }).join(""):`<div class="empty">${only?"No recent deal fits your watchlist yet.":"No new car under its price range yet."}</div>`;
 }
-const LABEL_NAMES={deal:"real deal",damaged:"damaged",fake:"fake price"};
-/* Label buttons on the New deals list: saved to the labels table, which the
-   report reads too. */
-$("deals").addEventListener("click",async e=>{
- const b=e.target.closest("button[data-label]");if(!b)return;
- const box=b.closest(".lb");
- try{
-  const r=await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
-   body:JSON.stringify({action:"label",source:box.dataset.source,id:box.dataset.id,label:b.dataset.label})});
-  const j=await r.json();
-  if(!r.ok)throw Error(j.message||r.statusText);
-  await refresh();
- }catch(err){notify("Could not save the label",String(err.message||err));}
-});
-
 const notified=new Set();
 async function refresh(){
  try{
@@ -467,6 +574,7 @@ async function refresh(){
    +(watching?" · watcher on":" · watcher off");
   $("stopButton").hidden=!running;
   $("logTitle").textContent=logSource==="job"?(task?`Output — ${task.name}`:"Output"):"Output — watcher";
+  buildPanes(d.sites||[]);
 
   document.querySelectorAll(".task").forEach(row=>{
    const isWatcher=row.dataset.task==="watcher";
@@ -474,7 +582,7 @@ async function refresh(){
    row.classList.toggle("running",mine);
    const b=row.querySelector("button");
    b.textContent=mine?"Stop":"Start";
-   b.className=mine?"danger":"";
+   b.className=mine?"danger":b.dataset.action==="update"?"primary":"";
    b.dataset.running=mine?"1":"";
    b.disabled=!isWatcher&&running&&!mine;
   });
@@ -488,27 +596,31 @@ async function refresh(){
   $("sDamaged").textContent=db.damaged==null?"—":fmt(db.damaged);
   $("sDamagedL").textContent=db.damage_checked
    ?`damaged · ${Math.round(db.damage_checked/Math.max(1,db.listings)*100)}% checked`:"damaged · not checked yet";
-  $("sPower").textContent=db.power_known==null?"—":Math.round(db.power_known/Math.max(1,db.listings)*100)+"%";
-  $("sDesc").textContent=fmt(db.descriptions);
-  $("sCand").textContent=fmt(db.candidates);
   const w=db.watcher;
   $("sNew").textContent=w?fmt(w.new_24h):"—";
   renderWatcher(w,watching);
   $("sReport").textContent=ago(db.report_built);
-  renderLog(logSource==="job"?d.logs:d.watcher_logs);
+  const b=d.backup,bl=$("backupLine");
+  bl.className="backupline"+(b&&b.error?" bad":"");
+  bl.textContent=!b?"Backups are off (set [backup] dir in config.local.toml)."
+   :b.error?`Backup failed: ${b.error}`
+   :b.last?`Backup: ${ago(b.last)} to ${b.dir} · every ${b.every_days} days · ${b.count} kept`
+   :`Backup: none yet · will be written to ${b.dir}`;
+  if(logSource==="job")renderLogs(d.logs,task?.sites,"No task started yet.");
+  else renderLogs(d.watcher_logs,wt?.sites,"The watcher has not printed anything yet.");
 
   for(const t of [task,wt].filter(Boolean)){const task=t;
    const id=task.started_at||task.name;
    if(task.error&&!notified.has(id+":e")){
     notified.add(id+":e");
-    if(task.challenge_url)notify("Autoplius refused a request","The refused page was opened in your browser. Wait a while, then restart the task — finished work is kept.","error",task.challenge_url);
+    if(task.challenge_url)notify(`${new URL(task.challenge_url).hostname} refused a request`,"The refused page was opened in your browser. Wait a while, then restart the task — finished work is kept.","error",task.challenge_url);
     else notify(`${task.name}: error`,task.error);
    }
    if(["failed","completed","stopped"].includes(task.status)&&!notified.has(id+":f")){
     notified.add(id+":f");
     if(task.status==="failed"&&!task.error)notify(`${task.name} failed`,`Exited with code ${task.exit_code}. See the output.`);
     else if(task.status==="stopped")notify(`${task.name} stopped`,"Stopped from the dashboard.","warning");
-    else if(task.status==="completed"&&task.name==="watcher")notify("Watcher stopped unexpectedly","Start it again to resume five-minute scans.");
+    else if(task.status==="completed"&&task.name==="watcher")notify("Watcher stopped unexpectedly","Start it again to resume its scans.");
     else if(task.status==="completed"){notify(`${task.name} finished`,"Completed successfully.","success");reportLoaded=false;}
    }
   }
@@ -518,7 +630,7 @@ async function refresh(){
 }
 showView(location.hash.slice(1));
 window.addEventListener("hashchange",()=>showView(location.hash.slice(1)));
-loadModels();refresh();setInterval(refresh,2000);
+loadModels();loadWatchlist();refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
 
@@ -581,6 +693,39 @@ def save_label(payload):
     return f"Marked as {LABELS[label]}." if label else "Label removed."
 
 
+def watchlist_state(wanted=None):
+    """The watchlist as the Watchlist page shows it, and whether alerts can
+    actually be sent."""
+    if wanted is None:
+        wanted = dict(watchlist.EMPTY)
+        if DB_PATH.exists():
+            connection = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                wanted = watchlist.load(connection)
+            finally:
+                connection.close()
+    return {"watchlist": wanted, "telegram": alerts.telegram_config() is not None,
+            "alerts_on": SETTINGS["alerts"]["deals"]}
+
+
+def save_watchlist(payload):
+    """Check and save the watchlist from the Watchlist page, and mark the
+    deals already listed against it. Returns (watchlist, message)."""
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        makes, pairs = watchlist.known_names(connection)
+        wanted = watchlist.parse(payload, makes, pairs)
+        watchlist.save(connection, wanted)
+        ensure_watch_tables(connection)
+        fits = watchlist.reflag(connection, wanted, SETTINGS["watcher"]["min_similar"])
+    finally:
+        connection.close()
+    if not watchlist.is_set(wanted):
+        return wanted, "Watchlist cleared: every confirmed deal counts again."
+    return wanted, (f"Saved: {watchlist.describe(wanted)}. "
+                    f"{fits} of the deals already listed fit it.")
+
+
 def save_database_models(text):
     """
     Choose which catalogue models the database scraper covers. Listed models
@@ -613,7 +758,7 @@ def save_database_models(text):
                 raise ValueError(
                     "Not in the Autoplius catalogue: " + ", ".join(unknown[:10])
                     + (f" and {len(unknown) - 10} more" if len(unknown) > 10 else "")
-                    + ". Run 'Resume scraping' once to sync the catalogue.")
+                    + ". Run 'Update database' once to sync the catalogue.")
             before = dict(((mk, md), en) for mk, md, en in store.conn.execute(
                 """SELECT make, model, MAX(enabled) FROM models
                    WHERE source = 'autoplius' GROUP BY make, model"""))
@@ -641,16 +786,37 @@ class JobManager:
         self.status = None
         self.started_at = None
         self.finished_at = None
-        self.logs = deque(maxlen=400)
+        self.logs = deque(maxlen=1000)
         self.error = None
         self.exit_code = None
         self.stop_requested = False
         self.challenge_url = None
         self.challenge_opened = False
+        self.sites = {}
+
+    def _track_site(self, text):
+        """Keep, per site, whether it is answering: {"state": "ok" | "blocked",
+        "problem": the line that said no, "problem_at", "last", "at"}. Two sites
+        run side by side, so "HTTP 403" has to be pinned on the one that got it."""
+        match = SITE_LINE_RE.match(text)
+        if not match or match.group(1) not in SITES or not match.group(2).strip():
+            return
+        line = match.group(2).strip()[:300]
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        info = self.sites.setdefault(match.group(1), {
+            "state": "ok", "problem": None, "problem_at": None, "clean": 0})
+        info["last"], info["at"] = line, now
+        if PROBLEM_RE.search(line):
+            info.update(state="blocked", problem=line, problem_at=now, clean=0)
+        elif info["state"] == "blocked":
+            info["clean"] += 1
+            if WORKING_RE.search(line) or info["clean"] >= CLEAR_AFTER:
+                info["state"] = "ok"
 
     def append_log(self, text):
         with self.lock:
             self.logs.append(text)
+            self._track_site(text)
             lowered = text.lower()
             if self.error is None and any(marker in lowered for marker in (
                 "traceback (most recent call last)",
@@ -675,7 +841,8 @@ class JobManager:
         if not match:
             return
         url = match.group(1).rstrip(".,)")
-        if urlparse(url).hostname != "autoplius.lt":
+        host = urlparse(url).hostname
+        if host not in REFUSED_HOSTS:
             return
         with self.lock:
             if self.challenge_opened:
@@ -689,13 +856,13 @@ class JobManager:
         else:
             if opened:
                 self.append_log(
-                    "Autoplius refused or challenged a request. Opened the page in your "
+                    f"{host} refused or challenged a request. Opened the page in your "
                     "browser for manual review; browser verification is not transferred "
                     "to the scraper.\n"
                 )
             else:
                 self.append_log(
-                    "Autoplius refused or challenged a request. The browser could not "
+                    f"{host} refused or challenged a request. The browser could not "
                     "be opened automatically; "
                     f"use the dashboard link: {url}\n"
                 )
@@ -716,6 +883,7 @@ class JobManager:
             self.stop_requested = False
             self.challenge_url = None
             self.challenge_opened = False
+            self.sites = {}
             self.process = _spawn(command)
             process = self.process
             self.status = "running"
@@ -798,6 +966,7 @@ class JobManager:
                     "error": self.error,
                     "exit_code": self.exit_code,
                     "challenge_url": self.challenge_url,
+                    "sites": {name: dict(info) for name, info in self.sites.items()},
                 }
             return task, list(self.logs)
 
@@ -843,8 +1012,11 @@ def database_summary():
                      for site in enabled_sites()}
             deals = sorted((d for h in sites.values() if h for d in h["deals"]),
                            key=lambda d: d["found_at"], reverse=True)[:40]
+            watched = sorted((d for h in sites.values() if h for d in h["watch_deals"]),
+                             key=lambda d: d["found_at"], reverse=True)[:40]
             result["watcher"] = {
-                "sites": sites, "deals": deals,
+                "sites": sites, "deals": deals, "watch_deals": watched,
+                "watchlist_set": watchlist.is_set(watchlist.load(connection)),
                 "new_24h": sum(h["new_24h"] for h in sites.values() if h),
             }
     finally:

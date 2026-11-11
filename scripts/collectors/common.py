@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import requests
@@ -26,6 +27,54 @@ HEADERS = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# whose output is this?
+# --------------------------------------------------------------------------- #
+# Several sites are scraped by the same scripts, and "HTTP 403" means little
+# without knowing who said it. Inside `with site_output("autoplius"):` every
+# line printed (stdout and stderr) starts with "[autoplius] "; the dashboard
+# splits its output by that tag and keeps a status per site.
+_OUTPUT_SITE = [None]
+
+
+class _SiteTagged:
+    """A text stream that starts each line with the current site's tag."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._line_start = True
+
+    def write(self, text):
+        tag = _OUTPUT_SITE[0]
+        if not tag or not text:
+            return self._stream.write(text)
+        out = []
+        for piece in text.splitlines(keepends=True):
+            if self._line_start and piece.strip():
+                out.append(f"[{tag}] ")
+            out.append(piece)
+            self._line_start = piece.endswith("\n")
+        self._stream.write("".join(out))
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+@contextmanager
+def site_output(source):
+    """Tag everything printed inside the block with "[source] "."""
+    if not isinstance(sys.stdout, _SiteTagged):
+        sys.stdout = _SiteTagged(sys.stdout)
+    if not isinstance(sys.stderr, _SiteTagged):
+        sys.stderr = _SiteTagged(sys.stderr)
+    previous, _OUTPUT_SITE[0] = _OUTPUT_SITE[0], source
+    try:
+        yield
+    finally:
+        _OUTPUT_SITE[0] = previous
+
+
 class BlockDetector:
     """
     Notices when the site is refusing us (403 / connection resets) and trips
@@ -38,6 +87,7 @@ class BlockDetector:
         self.threshold = threshold
         self.dump_path = Path(dump_path)
         self.first_status = None
+        self.first_reason = None      # what the first refused page looked like
         self.tripped = threading.Event()
         self._consecutive = 0
         self._dumped = False
@@ -48,6 +98,8 @@ class BlockDetector:
             self._consecutive += 1
             if self.first_status is None and status is not None:
                 self.first_status = status
+            if body and self.first_reason is None:
+                self.first_reason = refusal_kind(body)
             if body and not self._dumped:
                 try:
                     self.dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +135,11 @@ def diagnose(body: str) -> str:
     if not low.strip():
         return "an empty body — that's a firewall/IP-level drop, not a CAPTCHA"
     return "an unrecognised refusal page — open the saved file to see it"
+
+
+def refusal_kind(body: str) -> str:
+    """diagnose() in a few words, for one-line messages."""
+    return diagnose(body).split(" — ")[0]
 
 
 def probe(session, url, timeout=20):
@@ -134,7 +191,13 @@ def fetch(session: requests.Session, url: str, retries: int = 3, blocks=None) ->
                 if blocks is not None:
                     blocks.record_success()
                 return resp.text
-            print(f"  ! HTTP {resp.status_code} for {url}", file=sys.stderr)
+            # Say what kind of "no" it is: a rate limit passes by itself, a
+            # Cloudflare challenge or an IP block does not.
+            kind = ("rate limit: too many requests" if resp.status_code == 429
+                    else refusal_kind(resp.text) if resp.status_code in (401, 403, 503)
+                    else "")
+            print(f"  ! HTTP {resp.status_code} for {url}" + (f" — {kind}" if kind else ""),
+                  file=sys.stderr)
             if resp.status_code in (429, 503) and backoff < len(BACKOFF_SECONDS) \
                     and not STOP.is_set():
                 wait = _retry_after(resp) or BACKOFF_SECONDS[backoff]

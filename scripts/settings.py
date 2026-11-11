@@ -45,11 +45,13 @@ DEFAULTS = {
         "block_threshold": 8,
     },
     "watcher": {
-        "interval_minutes": 5.0,
+        "interval_minutes": 3.0,
         "margin_pages": 1,
         "max_pages": 50,
         "delay": 1.0,
         "read_cheap_ads": True,
+        "min_similar": 5,
+        "min_discount": 0.10,
     },
     "report": {
         "bucket": 3,
@@ -58,6 +60,11 @@ DEFAULTS = {
         "nightly_reads": 150,
         "stale_days": 10,
         "pooled": True,
+    },
+    "backup": {
+        "dir": "",
+        "every_days": 3.0,
+        "keep": 5,
     },
     "alerts": {
         "deals": True,

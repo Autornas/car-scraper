@@ -50,7 +50,7 @@ Status as of 2026-11-03.
 | | autoplius.lt | autogidas.lt |
 |---|---|---|
 | Used cars listed | ~46,500 | ~27,000 |
-| Newest-first sort | `order_by=3&order_direction=DESC` ("Naujausi viršuje") | `f_50=naujausi_desc` |
+| Newest-first sort | `order_by=3&order_direction=DESC` ("Naujausi viršuje") | `f_50=naujausi_asc` (`_desc` is oldest first) |
 | Results per page | 20 | 20 |
 | Card fields | title, year-month, body, price, fuel, gearbox, engine l + kW, km, town, dealer logo, age badge ("Prieš 7 min.") | title, price, year, fuel, km, gearbox, engine L + kW, town, age badge, `data-price`, `data-updated` |
 | Damage filter | `has_damaged_id[...]`, several values = OR | `f_46=<value>`, one value per search |
@@ -203,7 +203,7 @@ work for a site searched per make (fixed, tested). A static check
 2. Full scrape: walk by make/model (or price bands), the same resumable way.
 3. Damage sweep: the site-wide `f_46` search, once per defect type
    (Daužtas, Degęs, Skendęs, engine, gearbox, hail, other major, other minor).
-4. Watcher with `f_50=naujausi_desc`, using the same gap-free logic.
+4. Watcher with `f_50=naujausi_asc` (the site's newest-first value), using the same gap-free logic.
 5. Map autogidas make/model names into the shared catalogue.
 6. Read autogidas' terms of use before running it regularly. Keep request
    rates as polite as for Autoplius.

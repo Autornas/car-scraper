@@ -45,7 +45,7 @@ from pathlib import Path
 
 from collectors.dupes import find_duplicates, save_duplicates
 from collectors.verdicts import (IMPLAUSIBLE_SHARE, VERDICTS, classify, label_agrees,
-                                 load_labels, text_flags)
+                                 country_flags, load_labels, text_flags)
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
@@ -618,8 +618,10 @@ def load(db_path, compiled, min_price, max_price):
         # Keyword flags come from the seller's text and are only as complete as
         # the descriptions fetched, so they mark cars but never feed the model.
         c["suspect_declared"] = bool(c["damaged"] == 1 or c["damage_type"])
-        c["flags"] = ([c["damage_type"] or "declared defect"] if c["suspect_declared"] else []) \
+        c["flags"] = list(dict.fromkeys(
+            ([c["damage_type"] or "declared defect"] if c["suspect_declared"] else [])
             + text_flags(c["title"], c["description"])
+            + country_flags(c.get("reg_country"))))
         c["suspect"] = bool(c["flags"])
 
         first = first_price.get((c["source"], c["id"]), c["price_eur"])
@@ -1102,7 +1104,7 @@ HTML = r"""<!doctype html>
     no TA, export, parts, lease transfer) · <span class="pill odd">not a real price</span>
     under 30% of expected or far outside its group: a lease figure, deposit, typo or parts car.
     Unchecked cars become one of the others once their ad is read: the nightly job reads the
-    best ones, and <em>Check top candidates</em> in the dashboard does it on demand.</p>
+    best ones, and <em>Update database</em> in the dashboard does it on demand.</p>
     <p id="labelHelp"><strong>Your verdict.</strong> Open a car and mark it <em>real deal</em>,
     <em>damaged</em> or <em>fake price</em>. Your label overrides the verdict in this list,
     is kept in the database, and the <em>Verdicts</em> tab shows how often the two agree.
@@ -1203,7 +1205,7 @@ const detailRow = (c, cols) => {
       : VIEWER && !DATA.meta.viewer_descriptions ? ""
       : `<div class="muted">${c[C.description_checked] ? "The seller wrote no description."
         : VIEWER ? "The ad hasn't been read yet."
-        : "Description not fetched yet — run “Check top candidates” in the dashboard."}</div>`}
+        : "Description not fetched yet — “Update database” in the dashboard reads the best candidates."}</div>`}
     ${labelButtons(c)}</td></tr>`;
 };
 const VIEWER = !!DATA.meta.viewer;

@@ -28,11 +28,13 @@ description_delay = 2.0
 block_threshold = 8
 
 [watcher]
-interval_minutes = 5     # time between scan starts
+interval_minutes = 3     # time between scan starts
 margin_pages = 1         # extra pages read after the first all-known page
 max_pages = 50           # safety cap per scan (~1,000 ads, roughly a day)
 delay = 1.0              # seconds between page requests
 read_cheap_ads = true    # open the ad of every new car under its p10 to check for defects
+min_similar = 5          # similar cars (same model, year +-1, mileage +-30%) needed to confirm a deal; fewer = "maybe"
+min_discount = 0.10      # a deal is in the cheapest quarter of similar cars AND this far under their median
 
 [report]
 bucket = 3               # year-band width inside a generation
@@ -45,10 +47,18 @@ pooled = true            # LightGBM price model (false = per-group baselines)
 [dashboard]
 start_watcher = true     # start the watcher when the dashboard starts
 
+[backup]
+# Copies of the database on another drive (scripts/backup.py). The dashboard
+# makes one whenever the newest is older than every_days. Set the folder in
+# config.local.toml, since it belongs to one PC:  dir = "D:/car-scraper-backups"
+dir = ""                 # empty = no backups
+every_days = 3
+keep = 5                 # newest copies kept; older ones are deleted
+
 [alerts]
 # Telegram messages; off until a bot token is set in data/secrets.toml
 # (see scripts/collectors/alerts.py). Never put the token in this file.
-deals = true             # every new car the watcher rates "deal"
+deals = true             # new cars the watcher rates "deal" (only those on your watchlist, once you set one)
 watcher_failures = true  # a site's watcher failing 3 scans in a row
 
 [web]

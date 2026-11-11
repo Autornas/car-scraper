@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--no-watcher", action="store_true",
                     default=not SETTINGS["dashboard"]["start_watcher"],
-                    help="don't start the five-minute watcher on launch")
+                    help="don't start the watcher on launch")
     args = ap.parse_args()
     if not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
@@ -48,7 +48,7 @@ def main():
                  "(127.0.0.1). Reach it from elsewhere through Tailscale Serve or "
                  "Cloudflare Tunnel + Access.")
     try:
-        app = create_app(start_watcher=not args.no_watcher)
+        app = create_app(start_watcher=not args.no_watcher, start_backups=True)
     except ValueError as exc:
         sys.exit(f"config.toml: {exc}")
 

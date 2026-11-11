@@ -2,16 +2,19 @@
 """
 nightly.py — keep the database fresh without anyone pressing a button.
 
-    1. scrape.py           for each enabled site: syncs its catalogue (weekly),
-                           re-scrapes up to <site>.nightly_limit models older
-                           than max_age_days (oldest first; models with no ads
-                           only every empty_max_age_days), then runs the
-                           site-wide damage sweep
-    2. autoplius_stats.py  rebuilds the report and the saved price model, which
-                           a running watcher picks up by itself
-    3. scrape.py           reads the ads of up to report.nightly_reads of the best
-                           "unchecked" cars per site, and the report is rebuilt
-                           so they get a real verdict (deal / damaged / problem)
+Runs update.py with the nightly amounts (see update.py for the steps):
+
+    1. every enabled site at the same time: sync its catalogue (weekly),
+       re-scrape up to <site>.nightly_limit models older than max_age_days
+       (oldest first; models with no ads only every empty_max_age_days), then
+       its site-wide damage sweep
+    2. rebuild the report and the saved price model, which a running watcher
+       picks up by itself
+    3. read the ads of up to report.nightly_reads of the best "unchecked" cars
+       per site, and rebuild the report so they get a real verdict
+
+Per site, at most nightly_limit models a night, oldest first: a full refresh
+spreads over the week instead of one long burst the site rate-limits.
 
 Output goes to data/logs/nightly-YYYY-MM-DD.log. Run it by hand, or let Windows
 run it every night: scripts/install_nightly_task.ps1 registers that.
@@ -28,24 +31,6 @@ from pathlib import Path
 from settings import SETTINGS, project_path
 
 SCRIPTS = Path(__file__).resolve().parent
-from collectors import enabled_sites
-
-# Per site, at most nightly_limit models a night, oldest first: a full refresh
-# spreads over the week instead of one long burst the site rate-limits.
-STEPS = [(f"refresh {site.SOURCE}",
-          ["scrape.py", "--site", site.SOURCE,
-           "--limit", str(SETTINGS[site.SOURCE]["nightly_limit"])])
-         for site in enabled_sites()]
-STEPS.append(("rebuild report and price model", ["autoplius_stats.py"]))
-# Read the ads of the best "unchecked" cars (the report just listed them in
-# the candidates file), then rebuild so they get their real verdicts.
-_reads = SETTINGS["report"]["nightly_reads"]
-if _reads:
-    STEPS.append(("read top unchecked ads",
-                  ["scrape.py", "--backfill-descriptions", "--ids-file",
-                   str(project_path(SETTINGS["paths"]["data_dir"]) / "candidates.txt"),
-                   "--description-limit", str(_reads)]))
-    STEPS.append(("rebuild report with their verdicts", ["autoplius_stats.py"]))
 
 
 def main():
@@ -53,20 +38,15 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"nightly-{datetime.now():%Y-%m-%d}.log"
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    failed = []
     with log_path.open("a", encoding="utf-8") as log:
-        for name, args in STEPS:
-            log.write(f"\n=== {datetime.now():%H:%M:%S} {name} ===\n")
-            log.flush()
-            code = subprocess.call([sys.executable, "-u", str(SCRIPTS / args[0]), *args[1:]],
-                                   cwd=SCRIPTS.parent, stdout=log, stderr=subprocess.STDOUT,
-                                   env=env)
-            log.write(f"=== {datetime.now():%H:%M:%S} {name}: exit code {code} ===\n")
-            if code != 0:
-                failed.append(name)
-    print(f"Nightly refresh {'finished' if not failed else 'had failures: ' + ', '.join(failed)}."
-          f" Log: {log_path}")
-    return 1 if failed else 0
+        log.write(f"\n=== {datetime.now():%H:%M:%S} nightly update ===\n")
+        log.flush()
+        code = subprocess.call([sys.executable, "-u", str(SCRIPTS / "update.py"), "--nightly"],
+                               cwd=SCRIPTS.parent, stdout=log, stderr=subprocess.STDOUT,
+                               env=env)
+        log.write(f"=== {datetime.now():%H:%M:%S} exit code {code} ===\n")
+    print(f"Nightly refresh {'finished' if code == 0 else 'had failures'}. Log: {log_path}")
+    return 1 if code else 0
 
 
 if __name__ == "__main__":

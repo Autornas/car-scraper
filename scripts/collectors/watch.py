@@ -13,8 +13,12 @@ a WHOLE page holds nothing but ads it already knows, plus `margin_pages` more:
 
 New ads go straight into the database with every card field, and are priced
 at once with the saved pooled model (written by autoplius_stats.py). A new car
-under the low end of its range has its ad page read immediately and gets a
-verdict: deal / damaged / problem / not a real price, in the new_deals table.
+under the low end of its range is then compared with the similar cars already
+in the database (same model, year +-1, mileage +-30%): the price model alone
+called cars cheap that cost more than their neighbours. One that isn't cheap
+next to them is dropped; the rest have their ad page read and get a verdict:
+deal / maybe (too few similar cars to confirm) / damaged / problem / not a
+real price, in the new_deals table.
 Every scan is recorded in watch_scans, so a watcher that silently fails shows
 up on the dashboard.
 
@@ -22,14 +26,17 @@ up on the dashboard.
 """
 
 import sqlite3
+import statistics
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from collectors.common import DATA_DIR, BlockDetector, fetch, name_slug, normalized_label
-from collectors import alerts
+from collectors.common import (DATA_DIR, BlockDetector, fetch, name_slug, normalized_label,
+                               refusal_kind)
+from collectors import alerts, watchlist
 from collectors.dupes import same_car_elsewhere
-from collectors.verdicts import IMPLAUSIBLE_SHARE, classify, text_flags
+from collectors.verdicts import (IMPLAUSIBLE_SHARE, TOO_CHEAP_FLAG, classify, country_flags,
+                                 text_flags, too_cheap)
 from collectors.verdicts import SCHEMA as LABELS_SCHEMA
 
 SCHEMA = """
@@ -70,10 +77,14 @@ CREATE TABLE IF NOT EXISTS new_deals (
     lo       INTEGER,
     mid      INTEGER,
     hi       INTEGER,
-    verdict  TEXT,          -- deal / damaged / problem / not a real price / unchecked
+    verdict  TEXT,          -- deal / maybe / damaged / problem / not a real price / unchecked
     flags    TEXT,
     link     TEXT,
     also     TEXT,          -- the same car on another site: "site|price|link"
+    similar_n       INTEGER,   -- similar cars in the database when it was found
+    similar_cheaper INTEGER,   -- how many of them cost less than this one
+    similar_median  INTEGER,   -- their median asking price
+    watch    INTEGER,       -- 1 = fits your watchlist, 0 = doesn't, NULL = no watchlist set
     PRIMARY KEY (source, id)
 );
 CREATE INDEX IF NOT EXISTS idx_new_deals_found ON new_deals(found_at);
@@ -165,8 +176,14 @@ def walk(site, get_page, is_known, margin_pages=1, max_pages=50):
     known_pages = 0
     result = {"rows": new, "ages": ages, "pages": 0, "reached_known": False,
               "hit_cap": False, "failed": False}
+    sorted_newest = getattr(site, "is_newest_first", None)
     for page in range(1, max_pages + 1):
         html = get_page(page)
+        if page == 1 and html and sorted_newest and sorted_newest(html) is False:
+            # The site answered with another sort order. Walking it would find
+            # nothing new and report a healthy scan, so fail loudly instead.
+            result["failed"] = result["wrong_sort"] = True
+            break
         rows = list(site.scrape_page(html)) if html else []
         if not rows:                     # refused, empty or not a results page
             result["failed"] = True
@@ -199,22 +216,90 @@ def walk(site, get_page, is_known, margin_pages=1, max_pages=50):
 # --------------------------------------------------------------------------- #
 
 
-def verdict(price, lo, mid, details=None, title=None, description=None, read=False):
+def verdict(price, lo, mid, details=None, title=None, description=None, read=False,
+            similar=None, min_similar=5):
     """
     What a new ad priced under its range really is.
 
-      not a real price  under 30% of expected: lease figure, deposit, typo, parts
+      not a real price  under 30% of expected: lease figure, deposit, typo, parts.
+                        Or the ad says so itself (an auction bid, a price without
+                        VAT, a down payment), or the car costs under half of
+                        what enough similar cars ask and nothing explains it
       damaged           a defect declared on the ad ("Defektai")
-      problem           problem words in the seller's text (not running, no TA...)
+      problem           problem words in the seller's text (not running, no TA...),
+                        a US import or a UK (right-hand drive) car
       deal              nothing found after reading the ad
+      maybe             the same, but too few similar cars to confirm it
       unchecked         cheap, but the ad wasn't read
+
+    `details`: the ad page's fields (damage_type, reg_country); `similar`:
+    (similar cars in the database, how many are cheaper, their median) from
+    market_check, or None to judge without them.
     """
     if mid and price < IMPLAUSIBLE_SHARE * mid:
         return "not a real price", []
-    damage = (details or {}).get("damage_type")
-    flags = ([damage] if damage else []) + text_flags(title, description)
+    details = details or {}
+    damage = details.get("damage_type")
+    flags = list(dict.fromkeys(([damage] if damage else []) + text_flags(title, description)
+                               + country_flags(details.get("reg_country"))))
+    # Nothing in the ad explains it, yet it costs half of its neighbours.
+    if not flags and similar and too_cheap(price, similar[0], similar[2], min_similar):
+        flags.append(TOO_CHEAP_FLAG)
     # the same rules the report uses (collectors.verdicts.classify)
-    return classify(price, lo, mid, bool(damage), flags, read) or "unchecked", flags
+    result = classify(price, lo, mid, bool(damage), flags, read) or "unchecked"
+    if result == "deal" and similar is not None and (similar[0] or 0) < min_similar:
+        result = "maybe"                   # too few similar cars to confirm the model
+    return result, flags
+
+
+# --------------------------------------------------------------------------- #
+
+
+# is it cheap next to similar cars?
+
+
+# --------------------------------------------------------------------------- #
+
+
+def similar_prices(conn, source, ad_id, car, year_span=1, km_span=0.3, min_n=5):
+    """Asking prices of the cars most like this one already in the database:
+    same make/model, year within `year_span`, mileage within `km_span` (when
+    this car's is known), no declared defect. Same fuel only, when that still
+    leaves `min_n` cars."""
+    query = """SELECT price_eur, fuel FROM listings
+               WHERE make = ? AND model = ? AND year BETWEEN ? AND ?
+                 AND price_eur > 0 AND COALESCE(damaged, 0) = 0 AND damage_type IS NULL
+                 AND NOT (source = ? AND id = ?)"""
+    params = [car["make"], car["model"], car["year"] - year_span, car["year"] + year_span,
+              source, ad_id]
+    km = car.get("mileage_km")
+    if km:
+        query += " AND mileage_km BETWEEN ? AND ?"
+        params += [km * (1 - km_span), km * (1 + km_span)]
+    rows = conn.execute(query, params).fetchall()
+    same_fuel = [p for p, fuel in rows if car.get("fuel") and fuel == car["fuel"]]
+    return same_fuel if len(same_fuel) >= min_n else [p for p, _ in rows]
+
+
+def market_check(price, similar, min_n=5, min_discount=0.10, cheapest_share=0.25):
+    """
+    Is `price` really cheap next to `similar` (asking prices of similar cars)?
+
+      "cheap"      among the cheapest quarter and at least `min_discount`
+                   under their median
+      "not cheap"  enough similar cars, and it isn't
+      "few"        fewer than `min_n` similar cars: can't tell
+
+    Returns (state, n, cheaper, median): how many there are, how many cost
+    less than this one, and their median (None with no similar car).
+    """
+    n = len(similar)
+    cheaper = sum(1 for p in similar if p < price)
+    median = round(statistics.median(similar)) if similar else None
+    if n < min_n:
+        return "few", n, cheaper, median
+    cheap = cheaper <= cheapest_share * n and price <= (1 - min_discount) * median
+    return ("cheap" if cheap else "not cheap"), n, cheaper, median
 
 
 # --------------------------------------------------------------------------- #
@@ -231,8 +316,12 @@ def ensure_tables(conn):
     gained `also` in Phase 5, and the deals list joins `labels` (Phase 6)."""
     conn.executescript(SCHEMA)
     conn.executescript(LABELS_SCHEMA)
-    if "also" not in {r[1] for r in conn.execute("PRAGMA table_info(new_deals)")}:
-        conn.execute("ALTER TABLE new_deals ADD COLUMN also TEXT")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(new_deals)")}
+    for name, kind in (("also", "TEXT"), ("similar_n", "INTEGER"),
+                       ("similar_cheaper", "INTEGER"), ("similar_median", "INTEGER"),
+                       ("watch", "INTEGER")):
+        if name not in have:
+            conn.execute(f"ALTER TABLE new_deals ADD COLUMN {name} {kind}")
     conn.commit()
 
 
@@ -277,19 +366,31 @@ class WatchStore:
                  int(result["reached_known"]), int(result["hit_cap"]), oldest, message))
             self.store.conn.commit()
 
-    def record_deal(self, row, make, model, found, lo, mid, hi, verdict_, flags, also=None):
+    def record_deal(self, row, make, model, found, lo, mid, hi, verdict_, flags, also=None,
+                    similar=(None, None, None), watch=None):
+        """`similar`: (how many similar cars, how many are cheaper, their median);
+        `watch`: whether it fits the watchlist (None = no watchlist set)."""
         also_text = f"{also['source']}|{also['price_eur']}|{also['link']}" if also else None
         with self.store.lock:
             self.store.conn.execute(
                 """INSERT OR REPLACE INTO new_deals
                    (source, id, found_at, make, model, title, year, mileage_km, price,
-                    lo, mid, hi, verdict, flags, link, also)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    lo, mid, hi, verdict, flags, link, also,
+                    similar_n, similar_cheaper, similar_median, watch)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.source, row["id"], iso(found), make, model, row["title"],
                  row["year"] or None, row["mileage_km"] or None, row["price_eur"],
                  round(lo), round(mid), round(hi), verdict_, "|".join(flags), row["link"],
-                 also_text))
+                 also_text, *similar, None if watch is None else int(watch)))
             self.store.conn.commit()
+
+    def watchlist(self):
+        with self.store.lock:
+            return watchlist.load(self.store.conn)
+
+    def similar_prices(self, ad_id, car, min_n):
+        with self.store.lock:
+            return similar_prices(self.store.conn, self.source, ad_id, car, min_n=min_n)
 
     def same_car_elsewhere(self, car):
         with self.store.lock:
@@ -323,11 +424,15 @@ def health(conn, source, stale_minutes=15):
         new_24h = conn.execute(
             "SELECT COALESCE(SUM(new), 0) FROM watch_scans WHERE source = ? AND started_at > ?",
             (source, day_ago)).fetchone()[0]
-        deals = conn.execute(
-            """SELECT d.id, d.found_at, d.make, d.model, d.title, d.year, d.mileage_km,
-                      d.price, d.lo, d.mid, d.verdict, d.flags, d.link, d.also, l.label
-               FROM new_deals d LEFT JOIN labels l ON l.source = d.source AND l.id = d.id
-               WHERE d.source = ? ORDER BY d.found_at DESC LIMIT 30""", (source,)).fetchall()
+        select = """SELECT d.id, d.found_at, d.make, d.model, d.title, d.year, d.mileage_km,
+                           d.price, d.lo, d.mid, d.verdict, d.flags, d.link, d.also, l.label,
+                           d.similar_n, d.similar_cheaper, d.similar_median, d.watch
+                    FROM new_deals d LEFT JOIN labels l ON l.source = d.source AND l.id = d.id
+                    WHERE d.source = ?"""
+        deals = conn.execute(select + " ORDER BY d.found_at DESC LIMIT 30", (source,)).fetchall()
+        # the ones that fit the watchlist, further back than the recent 30
+        watched = conn.execute(
+            select + " AND d.watch = 1 ORDER BY d.found_at DESC LIMIT 30", (source,)).fetchall()
     except sqlite3.Error as exc:
         # Reported, not hidden: "never run" for a real error is how the
         # Phase 5 column change went unnoticed on the dashboard.
@@ -338,13 +443,15 @@ def health(conn, source, stale_minutes=15):
         age = (now_utc() - datetime.fromisoformat(last_ok)).total_seconds() / 60
         stale = age > stale_minutes
     keys = ("id", "found_at", "make", "model", "title", "year", "km", "price", "lo",
-            "mid", "verdict", "flags", "link", "also", "label")
+            "mid", "verdict", "flags", "link", "also", "label",
+            "similar_n", "similar_cheaper", "similar_median", "watch")
     deals = [{**dict(zip(keys, d)), "source": source} for d in deals]
+    watched = [{**dict(zip(keys, d)), "source": source} for d in watched]
     return {
         "last": dict(zip(("started_at", "status", "pages", "new", "reached_known",
                           "hit_cap", "message"), last)) if last else None,
         "last_ok": last_ok, "failures": failures, "stale": stale, "new_24h": new_24h,
-        "deals": deals,
+        "deals": deals, "watch_deals": watched,
     }
 
 
@@ -374,10 +481,13 @@ def scan(site, session, store, watch, model, compiled, args):
     blocks = BlockDetector(threshold=3)
     resolver = ModelResolver(watch.model_pairs())
 
+    last_html = [""]
+
     def get_page(n):
         if n > 1:
             time.sleep(args.delay)
-        return fetch(session, site.page_url(site.newest_url, n), blocks=blocks)
+        last_html[0] = fetch(session, site.page_url(site.newest_url, n), blocks=blocks)
+        return last_html[0]
 
     result = walk(site, get_page, watch.is_known, args.margin_pages, args.max_pages)
     new = result["rows"]
@@ -395,15 +505,28 @@ def scan(site, session, store, watch, model, compiled, args):
 
     deals = score_new(site, session, watch, rows, model, compiled, found, blocks, args)
 
-    if result["failed"] and not result["pages"]:
-        message = "No results page could be read; nothing changed."
+    if result.get("wrong_sort"):
+        message = ("The site's list is not sorted newest-first any more (its sort "
+                   "option changed); nothing stored. The site module's newest_url "
+                   "needs updating.")
+    elif result["failed"] and not result["pages"]:
+        # Name the refusal: "HTTP 403, a Cloudflare browser challenge" tells you
+        # whether waiting will help; "nothing could be read" doesn't.
+        if blocks.first_status:
+            why = f"HTTP {blocks.first_status}" + (
+                f", {blocks.first_reason}" if blocks.first_reason else "")
+        elif last_html[0]:
+            why = f"the page was not a results list: {refusal_kind(last_html[0])}"
+        else:
+            why = "no answer from the site"
+        message = f"No results page could be read ({why}); nothing changed."
     else:
         message = (f"{len(new)} new ad(s) on {result['pages']} page(s)"
                    + (f", {guessed} under a model not in the model list" if guessed else "")
                    + (f", {deals} below their price range" if deals else ""))
         if result["hit_cap"]:
             message += (f". Stopped at the {args.max_pages}-page cap: ads older than that "
-                        "may be missing; 'Resume scraping' fills the rest.")
+                        "may be missing; 'Update database' fills the rest.")
         elif result["failed"]:
             message += ". A later page failed; the next scan picks up from there."
     watch.record_scan(started, result, len(new), message)
@@ -419,6 +542,8 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
         return 0
     from autoplius_stats import generation_for
     cheap = 0
+    min_n, min_discount = getattr(args, "min_similar", 5), getattr(args, "min_discount", 0.10)
+    wanted = watch.watchlist()             # read every scan: edits apply at once
     for row in rows:
         if row["price_eur"] == "" or not row["year"]:
             continue
@@ -434,6 +559,14 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
         lo, mid, hi = model.price(car)
         if row["price_eur"] >= lo:
             continue
+        # The model says cheap. Do the similar cars in the database agree?
+        state, *similar = market_check(
+            row["price_eur"], watch.similar_prices(row["id"], car, min_n), min_n, min_discount)
+        if state == "not cheap":
+            print(f"  not cheap after all: {row['title']} {row['year']} €{row['price_eur']:,} "
+                  f"- {similar[1]} of {similar[0]} similar cars cost less "
+                  f"(their median €{similar[2]:,})", flush=True)
+            continue
         cheap += 1
         details, description, read = {}, None, False
         if args.read_cheap_ads and mid and row["price_eur"] >= IMPLAUSIBLE_SHARE * mid \
@@ -442,17 +575,70 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
             description, details, read, _ = site.fetch_ad_details(session, row["link"], blocks)
             if read:
                 watch.db.save_description(row["id"], description, details)
-        v, flags = verdict(row["price_eur"], lo, mid, details, row["title"], description, read)
+        v, flags = verdict(row["price_eur"], lo, mid, details, row["title"], description, read,
+                           similar, min_n)
         also = watch.same_car_elsewhere(car)
-        watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags, also)
-        if v == "deal":
+        watched = None
+        if watchlist.is_set(wanted):
+            watched = watchlist.matches(
+                wanted, make, model_name, row["price_eur"], row["year"], row["mileage_km"] or None,
+                watchlist.discount(row["price_eur"], mid, similar[0], similar[2], min_n))
+        watch.record_deal(row, make, model_name, found, lo, mid, hi, v, flags, also, similar,
+                          watched)
+        if watchlist.should_alert(wanted, v, watched):
             alerts.deal_alert(site.SOURCE, row["title"], row["year"], row["price_eur"],
-                              mid, lo, row["link"], also)
-        print(f"  {v.upper():<16} {row['title']} {row['year']} €{row['price_eur']:,} "
-              f"(expected €{mid:,.0f}, low end €{lo:,.0f}) {row['link']}"
+                              mid, lo, row["link"], also, similar, v)
+        print(f"  {v.upper():<16} {'★ ' if watched else ''}"
+              f"{row['title']} {row['year']} €{row['price_eur']:,} "
+              f"(expected €{mid:,.0f}, low end €{lo:,.0f}; "
+              + (f"{similar[1]} of {similar[0]} similar cars cheaper, median €{similar[2]:,}"
+                 if similar[0] else "no similar cars in the database")
+              + f") {row['link']}"
+              + (f"  [{', '.join(flags)}]" if flags else "")
               + (f"  [also on {also['source']} €{also['price_eur']:,}]" if also else ""),
               flush=True)
     return cheap
+
+
+def recheck_deals(conn, min_n=5, min_discount=0.10):
+    """
+    Judge the cars already in new_deals again with today's rules and today's
+    database: the word lists grow, and a car that had 2 similar cars last week
+    may have 20 now. Nothing is fetched; it works from what is stored. A car
+    that turns out not to be cheap next to its neighbours becomes "not cheap".
+    Returns how many verdicts changed.
+    """
+    ensure_tables(conn)
+    rows = conn.execute(
+        """SELECT d.source, d.id, d.price, d.lo, d.mid, d.verdict, d.flags, d.title, d.make,
+                  d.model, d.year, d.mileage_km, l.description, l.description_checked_at,
+                  l.damage_type, l.reg_country, l.fuel
+           FROM new_deals d LEFT JOIN listings l ON l.source = d.source AND l.id = d.id""").fetchall()
+    wanted = watchlist.load(conn)
+    changed = 0
+    for (source, ad_id, price, lo, mid, old, old_flags, title, make, model, year, km,
+         description, checked, damage, country, fuel) in rows:
+        if not price or not mid or not year:
+            continue
+        car = {"make": make, "model": model, "year": year, "mileage_km": km, "fuel": fuel}
+        state, *similar = market_check(
+            price, similar_prices(conn, source, ad_id, car, min_n=min_n), min_n, min_discount)
+        new, flags = verdict(price, lo, mid, {"damage_type": damage, "reg_country": country},
+                             title, description, bool(checked), similar, min_n)
+        if state == "not cheap" and new in ("deal", "maybe", "unchecked"):
+            new = "not cheap"
+        watched = None
+        if watchlist.is_set(wanted):
+            watched = int(watchlist.matches(
+                wanted, make, model, price, year, km,
+                watchlist.discount(price, mid, similar[0], similar[2], min_n)))
+        changed += new != old
+        conn.execute(
+            """UPDATE new_deals SET verdict = ?, flags = ?, similar_n = ?, similar_cheaper = ?,
+                      similar_median = ?, watch = ? WHERE source = ? AND id = ?""",
+            (new, "|".join(flags), *similar, watched, source, ad_id))
+    conn.commit()
+    return changed
 
 
 # --------------------------------------------------------------------------- #
@@ -468,6 +654,7 @@ def verify(site, session, watch, hours, delay):
     """Walk the newest-first list back `hours` (by the cards' age badges) and
     list every ad that is not in the database. Read-only."""
     limit, checked, missing = hours * 60, 0, []
+    counted = set()      # the newest ads are repeated on later pages: count each once
     blocks = BlockDetector(threshold=3)
     for page in range(1, 500):
         html = fetch(session, site.page_url(site.newest_url, page), blocks=blocks)
@@ -478,8 +665,9 @@ def verify(site, session, watch, hours, delay):
         ages = site.card_ages(html)
         for row in rows:
             age = ages.get(row["id"])
-            if age is not None and age > limit:
+            if row["id"] in counted or (age is not None and age > limit):
                 continue
+            counted.add(row["id"])
             checked += 1
             if not watch.is_known(row["id"]):
                 missing.append((age, row["title"], row["link"]))

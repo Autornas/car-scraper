@@ -30,7 +30,7 @@ import requests
 
 from collectors import crawl, enabled_sites, get_site
 from collectors.common import (STOP, BlockDetector, diagnose, install_sigint_handler,
-                               load_ids_file, load_models_file)
+                               load_ids_file, load_models_file, site_output)
 from collectors.store import Store, do_export, do_prune_gone, do_status
 from settings import SETTINGS, project_path
 
@@ -209,7 +209,8 @@ def main():
     refused = []
     try:
         for site in sites:
-            blocks = run_site(site, store, session, args)
+            with site_output(site.SOURCE):       # "[autoplius] ..." on every line
+                blocks = run_site(site, store, session, args)
             if blocks.tripped.is_set():
                 refused.append((site, blocks))
             if STOP.is_set():
@@ -226,11 +227,14 @@ def main():
         print(f"Models scraped        : {done} / {mtotal} enabled")
         print("=" * 68)
         for site, blocks in refused:
-            print(f"\n{site.SOURCE} was refusing requests when we stopped.", file=sys.stderr)
-            if blocks.dump_path.exists():
-                body = blocks.dump_path.read_text(encoding="utf-8", errors="replace")
-                print(f"Looks like: {diagnose(body)}", file=sys.stderr)
-            print("Wait a while, then re-run — finished models are skipped.", file=sys.stderr)
+            with site_output(site.SOURCE):
+                print(f"\n{site.SOURCE} was refusing requests when we stopped.",
+                      file=sys.stderr)
+                if blocks.dump_path.exists():
+                    body = blocks.dump_path.read_text(encoding="utf-8", errors="replace")
+                    print(f"Looks like: {diagnose(body)}", file=sys.stderr)
+                print("Wait a while, then re-run — finished models are skipped.",
+                      file=sys.stderr)
         store.close()
         session.close()
 
