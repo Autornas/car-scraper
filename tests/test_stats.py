@@ -80,3 +80,15 @@ def test_model_knows_only_trained_models(trained):
 
 def test_missing_model_loads_as_none(tmp_path):
     assert st.PriceModel.load(tmp_path) is None
+
+
+def test_model_needs_enough_cars_of_a_make_model(trained):
+    cars, _, directory = trained
+    model = st.PriceModel.load(directory)
+    n320 = sum(1 for c in cars if c["model"] == "320")
+    assert model.info["model_counts"]["bmw|320"] == n320
+    assert model.knows({"make": "bmw", "model": "320"}, min_cars=n320)
+    assert not model.knows({"make": "bmw", "model": "320"}, min_cars=n320 + 1)
+    # a model saved before the counts were kept: known if it was there at all
+    model.info.pop("model_counts")
+    assert model.knows({"make": "bmw", "model": "320"}, min_cars=10**6)

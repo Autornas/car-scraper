@@ -557,7 +557,7 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
                "gearbox": row["gearbox"], "body": row["body"], "dealer": row["dealer"],
                "gen": generation_for(make, model_name, row["year"], compiled),
                "price_eur": row["price_eur"], "location": row["location"]}
-        if not model.knows(car):          # never trained on this model: no verdict
+        if not model.knows(car):          # learned from too few cars of it: no verdict
             continue
         lo, mid, hi = model.price(car)
         if row["price_eur"] >= lo:

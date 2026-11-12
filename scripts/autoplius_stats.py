@@ -44,9 +44,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from collectors.dupes import find_duplicates, save_duplicates
-from collectors.verdicts import (IMPLAUSIBLE_SHARE, TOO_CHEAP_FLAG, VERDICTS, classify,
-                                 label_agrees, too_cheap,
-                                 country_flags, load_labels, text_flags)
+from collectors.verdicts import (FAKE_PRICE_FLAGS, IMPLAUSIBLE_SHARE, MIN_MODEL_CARS,
+                                 TOO_CHEAP_FLAG, VERDICTS, classify, country_flags,
+                                 label_agrees, load_labels, text_flags, too_cheap)
 from collectors.store import Store
 from settings import SETTINGS, project_path
 
@@ -417,9 +417,15 @@ def fit_pooled(cars, folds=5, seed=7, save_dir=None):
         # A new ad has no report band yet; it gets the key its make/model/year
         # was trained under.
         year_keys = {f"{c['make']}|{c['model']}|{c['year']}": gen_key(c) for c in cars}
+        # how many cars each make/model was learned from (PriceModel.knows)
+        model_counts = defaultdict(int)
+        for c, ok in zip(cars, train_ok):
+            if ok:
+                model_counts[f"{c['make']}|{c['model']}"] += 1
         PriceModel(boosters, codes, shift_lo, shift_hi, year_keys,
                    {"trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "n": int(train_ok.sum()), "err": summary["err"]}, names).save(save_dir)
+                    "n": int(train_ok.sum()), "err": summary["err"],
+                    "model_counts": dict(model_counts)}, names).save(save_dir)
         summary["saved"] = str(save_dir)
     return summary
 
@@ -465,10 +471,16 @@ class PriceModel:
         return cls(boosters, meta["codes"], meta["shift_lo"], meta["shift_hi"],
                    meta["year_keys"], meta.get("info", {}), meta.get("features"))
 
-    def knows(self, car):
-        """Whether this make/model was in the training data. For one that wasn't,
-        the price is a guess from unrelated cars and must not drive a verdict."""
-        return f"{car['make']}|{car['model']}" in self.codes["make_model"]
+    def knows(self, car, min_cars=MIN_MODEL_CARS):
+        """Whether this make/model was learned from at least `min_cars` cars.
+        For one it saw fewer times, or never, the price is a guess from
+        unrelated cars and must not drive a verdict. (A model saved before the
+        counts were kept only knows whether the make/model was there at all.)"""
+        key = f"{car['make']}|{car['model']}"
+        counts = self.info.get("model_counts")
+        if counts is None:
+            return key in self.codes["make_model"]
+        return counts.get(key, 0) >= min_cars
 
     def price(self, car):
         """(lo, mid, hi) in EUR for one listing dict, or None without a year."""
@@ -1791,6 +1803,11 @@ def main():
         con.close()
     prefix = "https://autoplius.lt/skelbimai/"
     sales = sale_ratios(cars) if pooled else {}
+    # cars per make/model: a model seen too rarely gives no deal verdict
+    per_model = defaultdict(int)
+    for c in cars:
+        if not c.get("price_outlier"):
+            per_model[(c["make"], c["model"])] += 1
     packed = []
     for c in cars:
         g = groups.get((c["make"], c["model"], c["grp"]))
@@ -1815,6 +1832,14 @@ def main():
         # watcher's market_check.)
         if c["verdict"] in ("deal", "unchecked") and sim_n >= SIMILAR_MIN \
                 and not (sim_cheaper <= 0.25 * sim_n and c["price_eur"] <= 0.9 * sim_median):
+            c["verdict"] = None
+        # Too few cars of this make/model for the model to price it: no verdict
+        # that rests on its price (deal, unchecked, or "not a real price" for
+        # being far under it). Damage and the ad's own words still count.
+        if per_model[(c["make"], c["model"])] < MIN_MODEL_CARS and (
+                c["verdict"] in ("deal", "unchecked")
+                or (c["verdict"] == "not a real price"
+                    and not set(c["flags"]) & FAKE_PRICE_FLAGS)):
             c["verdict"] = None
         q25, q75 = typical_range(lo, exp, c.get("p_hi") if pooled else None)
         c["label"] = labels.get((c["source"], c["id"]))

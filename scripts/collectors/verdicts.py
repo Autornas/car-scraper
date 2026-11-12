@@ -125,6 +125,12 @@ TOO_CHEAP_SHARE = 0.5
 TOO_CHEAP_MIN_MEDIAN = 5000
 TOO_CHEAP_FLAG = "under half of similar cars"
 
+# The price model learns a make/model from its own cars. With fewer than this
+# many it borrows from unrelated ones and its price can be wildly off: all 8
+# Citroën Amis (a small electric quadricycle) were priced like €20,000-35,000
+# cars and every one looked like a deal. Such models get no deal verdict.
+MIN_MODEL_CARS = 15
+
 
 def text_flags(*texts):
     """Problem keywords found in a title / description. Edit FLAG_PATTERNS freely:
