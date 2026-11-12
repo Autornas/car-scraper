@@ -459,10 +459,25 @@ database and lists the biggest gaps:
 ```
 
 **Nightly refresh.** `scripts/nightly.py` runs `update.py --nightly`: both
-sites at the same time, up to `nightly_limit` (500 Autoplius models, 100
-autogidas makes) of the stalest due ones, the damage sweeps, then the report
-and price model (a running watcher picks the new model up). 500 models a night covers the whole catalogue about once a week
-without one long burst of requests. To have Windows run it every night at 03:30:
+sites at the same time, every model (Autoplius) and make (autogidas) that has
+ads and wasn't scraped in the last `nightly_max_age_days` (0.5, so all of
+them), then the damage sweeps, the report and the price model (a running
+watcher picks the new model up). That is ~2,600 + ~1,400 pages, about two
+hours. Models with no ads are still re-checked only every `empty_max_age_days`.
+`nightly_limit` is only a safety cap.
+
+**Removed listings.** After each scrape, every listing its model's full
+scrape no longer finds is stamped with the date it went (`removed_at`), and the
+log says how many went since the last run. Nothing is deleted: the car keeps
+the last price it was asking, which is the closest thing to what it sold for.
+A listing that shows up again is un-stamped. In the report, removed cars still
+count in the price model, the group medians and "Similar cars"; a car's details
+also show **Similar cars sold** (how many, and their typical last price). Once
+5 or more similar cars have sold, **sells for ≈** is their median last price;
+until then it is the usual price times the ratio all sold cars went at.
+(`scrape.py --prune-gone` would delete them: don't run it if you want those prices.)
+
+To have Windows run it every night at 03:30:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_nightly_task.ps1

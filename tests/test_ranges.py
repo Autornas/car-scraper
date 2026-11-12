@@ -103,3 +103,23 @@ def test_sale_price_uses_its_price_band_when_the_band_has_enough():
     assert n == 80 and sale == pytest.approx(8_000 * table["all"][0])
     assert st.likely_sale(None, table) == (None, 0)
     assert st.likely_sale(1_000, {}) == (None, 0)
+
+
+def test_similar_cars_that_sold_are_counted_on_their_own():
+    target = car(0, 2005, 300_000, 900)
+    up = [car(i, 2005, 300_000, 2000) for i in range(1, 4)]
+    sold = [car(i, 2005, 300_000, 1000 + i, gone=True) for i in range(10, 15)]
+    st.attach_similar([target, *up, *sold])
+    assert target["similar"][0] == 8                      # sold ones still compare
+    assert target["sold_similar"] == (5, 1012)
+    st.attach_similar([target, *up])
+    assert target["sold_similar"] is None
+
+
+def test_sale_price_prefers_similar_cars_that_sold():
+    table = st.sale_ratios([gone(i, 1000, 800) for i in range(30)])
+    assert st.likely_sale(10_000, table, (5, 7_500)) == (7_500, 5)
+    # too few sold neighbours: the ratio again
+    assert st.likely_sale(10_000, table, (4, 7_500)) == (pytest.approx(8_000), 30)
+    # no price model at all, but enough sold neighbours
+    assert st.likely_sale(None, {}, (6, 7_500)) == (7_500, 6)

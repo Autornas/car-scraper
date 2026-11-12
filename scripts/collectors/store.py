@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS listings (
     damaged      INTEGER,     -- 1 = in the site's damaged-only search, 0 = not, NULL = unknown
     damage_type  TEXT,        -- the ad page's own "Defektai" value
     reg_country  TEXT,        -- "Pirmosios registracijos šalis"
-    removed_at   TEXT,        -- its ad page answered "not found": taken down
+    removed_at   TEXT,        -- when it was found taken down: its ad page answered
+                              -- "not found", or a full scrape of its model missed it
     PRIMARY KEY (source, id)
 );
 CREATE INDEX IF NOT EXISTS idx_make_model ON listings(make, model);
@@ -285,6 +286,7 @@ class SiteStore:
                     cur.execute(
                         """UPDATE listings
                            SET last_seen = ?, seen_count = seen_count + 1,
+                               removed_at = NULL,
                                price_eur = ?, make = ?, model = ?,
                                mileage_km = COALESCE(?, mileage_km),
                                power_kw = COALESCE(?, power_kw),
@@ -378,6 +380,25 @@ class SiteStore:
                    WHERE source = ? AND id = ?""",
                 (now_iso(), now_iso(), self.source, ad_id))
             self.conn.commit()
+
+    def stamp_gone(self, ids):
+        """Record when each of these listings was found gone (a full scrape of
+        its model no longer lists it). Its last price stays: that is what the
+        car was really asking when it went. Already stamped ones keep their
+        date; a listing seen again later is un-stamped by upsert_many.
+        Returns how many were newly stamped."""
+        if not ids:
+            return 0
+        with self.lock:
+            stamp = now_iso()
+            n = 0
+            for ad_id in ids:
+                n += self.conn.execute(
+                    """UPDATE listings SET removed_at = ?
+                       WHERE source = ? AND id = ? AND removed_at IS NULL""",
+                    (stamp, self.source, ad_id)).rowcount
+            self.conn.commit()
+        return n
 
     def apply_damage_sweep(self, damaged_ids):
         """Record one complete site-wide damaged search: those ids are damaged,

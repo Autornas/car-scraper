@@ -16,8 +16,9 @@ being refused doesn't stop the other, and the report is rebuilt either way.
 
     python scripts/update.py             # everything that is due
     python scripts/update.py --force     # every model again, however fresh
-    python scripts/update.py --nightly   # at most <site>.nightly_limit models per
-                                         # site and report.nightly_reads ad reads
+    python scripts/update.py --nightly   # every model with ads not scraped in the
+                                         # last <site>.nightly_max_age_days (all of
+                                         # them), and report.nightly_reads ad reads
     python scripts/update.py --site autoplius
 
 The dashboard's "Update database" button runs this; nightly.py runs it with
@@ -145,7 +146,7 @@ def main():
                     help="only this site (repeatable); default: every enabled site")
     ap.add_argument("--force", action="store_true", help="re-scrape every model")
     ap.add_argument("--nightly", action="store_true",
-                    help="the nightly amounts: nightly_limit models, nightly_reads ad reads")
+                    help="the nightly run: every model with ads, nightly_reads ad reads")
     ap.add_argument("--reads", type=int, default=None,
                     help="ad pages to read per site (default: report.candidates, "
                          "or report.nightly_reads with --nightly; 0 = none)")
@@ -180,7 +181,11 @@ def main():
     def scrape_args(site):
         extra = ["--force"] if args.force else []
         if args.nightly:
-            extra += ["--limit", str(SETTINGS[site.SOURCE]["nightly_limit"])]
+            # every model with ads, every night: a removed ad is noticed the next
+            # morning, and a sold car keeps the last price it was really asking
+            cfg = SETTINGS[site.SOURCE]
+            extra += ["--max-age", str(cfg["nightly_max_age_days"]),
+                      "--limit", str(cfg["nightly_limit"])]
         return extra
 
     db_path = project_path(SETTINGS["paths"]["database"])

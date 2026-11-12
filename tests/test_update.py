@@ -46,8 +46,9 @@ def test_update_runs_the_sites_together_and_tags_their_lines(tmp_path, monkeypat
 
 def test_update_force_and_nightly_reach_the_scraper(tmp_path, monkeypatch, capsys):
     _, lines = run(tmp_path, monkeypatch, capsys, "--force", "--nightly", "--reads", "0")
-    limit = update.SETTINGS["autoplius"]["nightly_limit"]
-    assert f"[autoplius] args --site autoplius --force --limit {limit}" in lines
+    cfg = update.SETTINGS["autoplius"]
+    assert (f"[autoplius] args --site autoplius --force --max-age {cfg['nightly_max_age_days']}"
+            f" --limit {cfg['nightly_limit']}") in lines
     assert lines.count("report built") == 1                 # no reads: one rebuild
     assert not any("--backfill-descriptions" in line for line in lines)
 

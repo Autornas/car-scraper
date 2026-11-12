@@ -31,7 +31,7 @@ import requests
 from collectors import crawl, enabled_sites, get_site
 from collectors.common import (STOP, BlockDetector, diagnose, install_sigint_handler,
                                load_ids_file, load_models_file, site_output)
-from collectors.store import Store, do_export, do_prune_gone, do_status
+from collectors.store import Store, do_export, do_prune_gone, do_status, find_gone
 from settings import SETTINGS, project_path
 
 # Per-site values come from that site's section of config.toml; a flag given
@@ -173,6 +173,13 @@ def run_site(site, store, session, args):
         print(f"[{i}/{len(todo)}] {make}/{model}")
         crawl.scrape_model(site, url, make, model, db, session, blocks, args)
         time.sleep(args.delay)       # most models are one page: keep the pace polite
+    if todo:
+        # Listings a full model scrape no longer finds: sold or withdrawn.
+        # They stay in the database with their last price and today's date.
+        gone = [ad_id for _, ad_id in find_gone(store, site.SOURCE)]
+        stamped = db.stamp_gone(gone)
+        print(f"{stamped} listing(s) removed from {site.SOURCE} since they were last seen "
+              f"(kept with their last price; {len(gone)} gone in all)")
     if todo and wanted is None and not args.no_damage_sweep \
             and not STOP.is_set() and not blocks.tripped.is_set():
         crawl.damage_sweep(site, db, session, blocks, args)

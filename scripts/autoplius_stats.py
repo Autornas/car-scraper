@@ -781,6 +781,10 @@ def attach_similar(cars, years=SIMILAR_YEARS, km_share=SIMILAR_KM, min_n=SIMILAR
     words) or a fake price are not used as comparisons. Sets c["similar"] to
     (n, how many are cheaper, median, p25, p75), or n = 0 with no similar car.
     The same comparison the watcher makes (collectors.watch.similar_prices).
+
+    Similar cars that have left the sites (sold or withdrawn) are kept in
+    that comparison with the last price they asked, and are also summed up on
+    their own in c["sold_similar"]: (n, median last price), or None with none.
     """
     by_model = defaultdict(list)
     for c in cars:
@@ -793,7 +797,10 @@ def attach_similar(cars, years=SIMILAR_YEARS, km_share=SIMILAR_KM, min_n=SIMILAR
                 and (not km or (o.get("mileage_km")
                                 and km * (1 - km_share) <= o["mileage_km"] <= km * (1 + km_share)))]
         same_fuel = [o for o in near if fuel and o.get("fuel") == fuel]
-        prices = sorted(o["price_eur"] for o in (same_fuel if len(same_fuel) >= min_n else near))
+        pool = same_fuel if len(same_fuel) >= min_n else near
+        sold = [o["price_eur"] for o in pool if o.get("gone")]
+        c["sold_similar"] = (len(sold), round(statistics.median(sold))) if sold else None
+        prices = sorted(o["price_eur"] for o in pool)
         if not prices:
             c["similar"] = (0, 0, None, None, None)
             continue
@@ -828,9 +835,14 @@ def sale_ratios(cars, min_n=SALE_MIN, bands=SALE_BANDS):
     return table
 
 
-def likely_sale(mid, table):
+def likely_sale(mid, table, sold_similar=None, min_sold=SIMILAR_MIN):
     """(likely sale price, how many sold cars it rests on) for an expected
-    asking price, or (None, 0)."""
+    asking price, or (None, 0). With at least `min_sold` similar cars that
+    already sold (sold_similar = (n, median last price)), their median last
+    price is the answer: what cars just like this one really went for.
+    Otherwise the expected price times the sold cars' usual ratio."""
+    if sold_similar and sold_similar[0] >= min_sold:
+        return sold_similar[1], sold_similar[0]
     if not mid or not table:
         return None, 0
     for band, (r, n) in table.items():
@@ -1256,8 +1268,9 @@ const detailRow = (c, cols) => {
     ["Days listed", c[C.days]], ["Flags", (c[C.flags]||"").split("|").join(", ")],
     ["Also listed", alsoList(c).map(o => `${o.src} ${o.price ? eur(o.price) : ""}`).join(", ")],
     ["Usual price range", c[C.q25] ? `${eur(c[C.q25])}–${eur(c[C.q75])} (half of such cars ask this)` : ""],
-    ["Similar cars for sale", c[C.sim] ? `${c[C.sim][0]}, typically ${eur(c[C.sim][2])}; this one is cheaper than ${
+    ["Similar cars", c[C.sim] ? `${c[C.sim][0]}, typically ${eur(c[C.sim][2])}; this one is cheaper than ${
       c[C.sim][0]-c[C.sim][1]} of them` : ""],
+    ["Similar cars sold", c[C.sold] ? `${c[C.sold][0]}, last price typically ${eur(c[C.sold][1])}` : ""],
     ["Site", SITES.length > 1 ? c[C.src] : ""],
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
@@ -1637,7 +1650,9 @@ function drawCars(){
       <td class="num">${num(r.km)}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
       <td class="num">${eur(r.base)}${r.c[C.sale]
-        ?`<span class="s" title="what cars like this actually sell for">sells for ≈ ${eur(r.c[C.sale])}</span>`:""}</td>
+        ?`<span class="s" title="${r.c[C.sold] && r.c[C.sold][0] >= 5
+          ? `the last price of ${r.c[C.sold][0]} similar cars that sold`
+          : "what cars like this actually sell for"}">sells for ≈ ${eur(r.c[C.sale])}</span>`:""}</td>
       ${cheaperCell(r)}
       <td>${alink(r.c[C.link])}</td></tr>${detailRow(r.c,7)}`,
     7, want === "old" ? "no sold or old cars match the filters" : "no cars match the filters");
@@ -1795,7 +1810,7 @@ def main():
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
             "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also",
-            "aid", "verdict", "label", "stale", "seen", "q25", "q75", "sim", "sale"]
+            "aid", "verdict", "label", "stale", "seen", "q25", "q75", "sim", "sale", "sold"]
     con = sqlite3.connect(args.db)
     try:
         labels = load_labels(con)
@@ -1842,6 +1857,7 @@ def main():
                     and not set(c["flags"]) & FAKE_PRICE_FLAGS)):
             c["verdict"] = None
         q25, q75 = typical_range(lo, exp, c.get("p_hi") if pooled else None)
+        sale = likely_sale(exp, sales, c.get("sold_similar"))[0]
         c["label"] = labels.get((c["source"], c["id"]))
         packed.append([
             c["make"], c["model"], c["grp"], c["year"], c["price_eur"],
@@ -1861,7 +1877,8 @@ def main():
             1 if c["stale"] else 0, c["seen_date"],
             round(q25) if q25 else None, round(q75) if q75 else None,
             list(c["similar"]) if c["similar"][0] else None,
-            round(likely_sale(exp, sales)[0]) if sales and exp else None])
+            round(sale) if sale else None,
+            list(c["sold_similar"]) if c.get("sold_similar") else None])
 
     # The "unchecked" cars, best first: what the targeted description fetch
     # (scrape.py --ids-file) should spend its requests on. Reading their ads

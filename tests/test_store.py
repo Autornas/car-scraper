@@ -202,3 +202,24 @@ def test_a_challenge_page_never_clears_damage_flags(tmp_path, monkeypatch):
     assert crawl.damage_sweep(ap, db, None, blocks, args) is None
     assert store.conn.execute("SELECT damaged FROM listings").fetchone()[0] == 1
     store.close()
+
+
+def test_a_gone_listing_is_stamped_once_keeps_its_price_and_unstamps_if_seen_again(tmp_path):
+    store = Store(tmp_path / "t.db")
+    db = store.site("autoplius")
+    db.upsert_many([row("1"), row("2")], "bmw", "320")
+    assert db.stamp_gone(["1"]) == 1
+    first = store.conn.execute("SELECT removed_at FROM listings WHERE id = '1'").fetchone()[0]
+    assert first
+    assert db.stamp_gone(["1"]) == 0                       # keeps the day it went
+    assert store.conn.execute(
+        "SELECT removed_at FROM listings WHERE id = '1'").fetchone()[0] == first
+    # nothing else is touched, and the car is still there with its price
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE removed_at IS NOT NULL").fetchone()[0] == 1
+    assert store.conn.execute(
+        "SELECT price_eur FROM listings WHERE id = '1'").fetchone()[0] is not None
+    db.upsert_many([row("1")], "bmw", "320")               # back on the site after all
+    assert store.conn.execute(
+        "SELECT removed_at FROM listings WHERE id = '1'").fetchone()[0] is None
+    store.close()

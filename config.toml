@@ -13,7 +13,9 @@ delay = 2.0              # seconds between requests (faster got HTTP 429 + a CAP
 concurrency = 1          # pages fetched in parallel per batch
 max_age_days = 7         # re-scrape a model once it is older than this
 empty_max_age_days = 30  # re-check models that had no listings this often
-nightly_limit = 500      # models per nightly run, oldest first (~a full pass a week)
+nightly_max_age_days = 0.5   # nightly: re-scrape every model with ads not scraped in the last 12 h,
+                             # i.e. all of them, so a removed ad is noticed the next morning (~2 h)
+nightly_limit = 5000     # safety cap on models per nightly run, oldest first
 description_delay = 2.0  # seconds between ad-page requests
 block_threshold = 8      # consecutive refusals before a run stops
 
@@ -23,7 +25,8 @@ delay = 2.0
 concurrency = 1
 max_age_days = 7         # searched per make (~90 makes), so a full pass is ~1,400 pages
 empty_max_age_days = 30
-nightly_limit = 100      # makes per nightly run
+nightly_max_age_days = 0.5   # nightly: every make, every night (~1,400 pages, ~1 h)
+nightly_limit = 300      # safety cap on makes per nightly run
 description_delay = 2.0
 block_threshold = 8
 
