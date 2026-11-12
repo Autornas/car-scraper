@@ -791,6 +791,43 @@ def attach_similar(cars, years=SIMILAR_YEARS, km_share=SIMILAR_KM, min_n=SIMILAR
     return cars
 
 
+# Likely sale price. The model learns ASKING prices; the cars that leave the
+# sites (most likely sold) went at a lower last asking price than expected
+# (0.81x with the first 104). Their median ratio, per expected-price band when
+# a band has enough of them, turns "typical asking" into "likely sale".
+SALE_MIN = 30              # fewer gone cars than this: no estimate
+SALE_BANDS = (0, 2_000, 5_000, 15_000, 10**9)
+
+
+def sale_ratios(cars, min_n=SALE_MIN, bands=SALE_BANDS):
+    """{"all": (ratio, n), (lo, hi): (ratio, n), ...} from the cars that left
+    the sites, or {} when too few have. Cars with a flag or a fake price are
+    left out: their price says nothing about what a sound car sells for."""
+    gone = [c for c in cars if c.get("gone") and c.get("p_mid") and c["price_eur"]
+            and not c.get("suspect") and not c.get("price_outlier")]
+    if len(gone) < min_n:
+        return {}
+    ratio = lambda rows: statistics.median(c["price_eur"] / c["p_mid"] for c in rows)
+    table = {"all": (ratio(gone), len(gone))}
+    for lo, hi in zip(bands, bands[1:]):
+        rows = [c for c in gone if lo <= c["p_mid"] < hi]
+        if len(rows) >= min_n:
+            table[(lo, hi)] = (ratio(rows), len(rows))
+    return table
+
+
+def likely_sale(mid, table):
+    """(likely sale price, how many sold cars it rests on) for an expected
+    asking price, or (None, 0)."""
+    if not mid or not table:
+        return None, 0
+    for band, (r, n) in table.items():
+        if band != "all" and band[0] <= mid < band[1]:
+            return mid * r, n
+    r, n = table["all"]
+    return mid * r, n
+
+
 def merge_duplicates(cars, db_path):
     """
     The same car listed on two sites becomes one row: the cheaper listing
@@ -1053,6 +1090,7 @@ HTML = r"""<!doctype html>
   .rbar .wide{fill:var(--surface-3)}.rbar .mid{fill:var(--series-1);opacity:.45}
   .rbar .dot{fill:var(--text-primary);stroke:var(--surface-1);stroke-width:1.5}
   .rbar .dot.under{fill:var(--good)}.rbar .dot.over{fill:var(--bad)}
+  .s.sale{color:var(--text-secondary);margin-top:2px}
   .count{color:var(--text-muted);font-size:12px}
   .empty{padding:22px;color:var(--text-muted);font-size:14px;text-align:center}
   /* Not wide enough for groups and their cars side by side: stack them, each
@@ -1105,8 +1143,9 @@ HTML = r"""<!doctype html>
       <option value="problem" data-name="Problem">Problem</option>
       <option value="not a real price" data-name="Not a real price">Not a real price</option>
       <option value="labelled" data-name="Labelled by you">Labelled by you</option>
-      <option value="all" data-name="Everything under expected">Everything under expected</option>
+      <option value="all" data-name="Everything under typical asking">Everything under typical asking</option>
     </select>
+    <label class="toggle" title="Also list the cars priced at or above their typical asking price, to see the whole market for a model"><input type="checkbox" id="showAll">Show dearer cars too</label>
     <label class="toggle"><input type="checkbox" id="showOld">Include cars not seen
       recently&nbsp;<span id="oldCount" class="muted"></span></label>
     <span class="spacer"></span>
@@ -1137,10 +1176,10 @@ HTML = r"""<!doctype html>
     <th data-k="car">Car</th>
     <th class="num" data-k="year">Year</th>
     <th class="num" data-k="price">Price</th>
-    <th class="num" data-k="base">Expected <span class="muted">/ typical range</span></th>
+    <th class="num" data-k="base">Typical asking <span class="muted">/ range · likely sale</span></th>
     <th class="num" data-k="simrank">Similar cars</th>
     <th class="num" data-k="vslo">vs low end</th>
-    <th class="num" data-k="vs">vs expected</th>
+    <th class="num" data-k="vs">vs asking</th>
     <th class="num" data-k="km">km</th>
     <th></th>
   </tr></thead><tbody></tbody></table></div>
@@ -1211,6 +1250,7 @@ const detailRow = (c, cols) => {
     ["First price", c[C.first] && c[C.first]!==c[C.price] ? eur(c[C.first]) : ""],
     ["Days listed", c[C.days]], ["Flags", (c[C.flags]||"").split("|").join(", ")],
     ["Also listed", alsoList(c).map(o => `${o.src} ${o.price ? eur(o.price) : ""}`).join(", ")],
+    ["Likely sale price", c[C.sale] ? `≈ ${eur(c[C.sale])} (from ${DATA.meta.sale.n} cars that left the sites)` : ""],
     ["Typical range", c[C.q25] ? `${eur(c[C.q25])}–${eur(c[C.q75])} (low end ${eur(c[C.lo])}, high ${eur(c[C.hi])})` : ""],
     ["Similar cars", c[C.sim] ? `${c[C.sim][0]} · median ${eur(c[C.sim][2])} · middle half ${eur(c[C.sim][3])}–${eur(c[C.sim][4])}` : ""],
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
@@ -1342,7 +1382,12 @@ document.getElementById("tiles").innerHTML=[
 document.getElementById("basisNote").textContent = DATA.meta.pooled
   ? "Each car is compared with a pooled price model trained on every listing (make, model, "
     + "generation, year, mileage, fuel, engine, kW, gearbox, body, seller type, declared damage), "
-    + "using a model that never saw that car. Expected is its median. The typical range is "
+    + "using a model that never saw that car. Typical asking is the median ASKING price for "
+    + "that car — what sellers list it for, not what it sells for. Likely sale is that price "
+    + "times what the cars that left the sites (most likely sold) last asked compared with "
+    + "their typical asking, per price band once a band has 30 of them" + (DATA.meta.sale
+    ? ` (${DATA.meta.sale.ratio.toFixed(2)}× overall so far, from ${DATA.meta.sale.n} cars; it `
+    + "updates itself as more cars sell)" : " (not enough sold cars yet)") + ". The typical range is "
     + "where half of identical cars sit (25th-75th percentile); the bar under it also shows the "
     + "10th-90th, and the dot is this car's price. The low end used for deals is the 10th "
     + "percentile. Similar cars are real listings: same model, year ±1, mileage ±30%, no "
@@ -1429,6 +1474,7 @@ document.getElementById("gearSel").onchange=readFilters;
 document.getElementById("siteSel").onchange=readFilters;
 document.getElementById("verdictSel").onchange=()=>drawCars();
 document.getElementById("showOld").onchange=()=>drawCars();
+document.getElementById("showAll").onchange=()=>drawCars();
 if (DATA.meta.viewer) {
   document.querySelector('#verdictSel option[value="labelled"]').remove();
   document.getElementById("labelHelp").remove();
@@ -1600,12 +1646,13 @@ function drawCars(){
   const sel = document.getElementById("verdictSel"), want = sel.value;
   const rows = [], counts = {all: 0, labelled: 0}; let shownByDefault = 0;
   const showOld = document.getElementById("showOld").checked; let old = 0;
+  const showAll = document.getElementById("showAll").checked;
   for(const c of DATA.cars){
     if(!match(c))continue;
     const g=GMAP[gkey(c)];
     if(!g && c[C.exp]==null)continue;
     const r=carRow(c,g);
-    if(!(r.vs>0))continue;
+    if(!(r.vs>0) && !showAll)continue;
     /* sold (gone) or not seen for a while (stale): hidden unless asked for */
     if ((c[C.gone] || c[C.stale]) && !showOld) { old++; continue; }
     const v = effVerdict(c);
@@ -1629,7 +1676,9 @@ function drawCars(){
       <td class="num"><strong>${eur(r.price)}</strong></td>
       <td class="num" title="${r.modelled?"what the model expects for this exact car; half of identical cars sit in the typical range":"group median"}">${
         eur(r.base)}${r.modelled?"":'<span class="pill">med</span>'}<span class="s">${
-        r.q25?eur(r.q25)+"–"+eur(r.q75):"&nbsp;"}</span>${rangeBar(r)}</td>
+        r.q25?eur(r.q25)+"–"+eur(r.q75):"&nbsp;"}</span>${rangeBar(r)}${r.c[C.sale]
+        ?`<span class="s sale" title="what cars like this most likely sell for: typical asking scaled by what ${
+          DATA.meta.sale.n} cars that left the sites (most likely sold) last asked">likely sale ≈ ${eur(r.c[C.sale])}</span>`:""}</td>
       ${simCell(r.sim)}
       ${vsCell(r.vslo)}${vsCell(r.vs)}
       <td class="num">${num(r.km)}${r.kmr?`<span class="s"${r.kmr>1.3?' style="color:var(--warn)"':""}>${r.kmr}× group</span>`:""}</td>
@@ -1782,13 +1831,14 @@ def main():
             "link", "kmr", "drop", "first", "days", "gone", "exp", "odd",
             "description", "description_checked",
             "lo", "hi", "kw", "gear", "body", "flags", "loc", "dealer", "src", "also",
-            "aid", "verdict", "label", "stale", "seen", "q25", "q75", "sim"]
+            "aid", "verdict", "label", "stale", "seen", "q25", "q75", "sim", "sale"]
     con = sqlite3.connect(args.db)
     try:
         labels = load_labels(con)
     finally:
         con.close()
     prefix = "https://autoplius.lt/skelbimai/"
+    sales = sale_ratios(cars) if pooled else {}
     packed = []
     for c in cars:
         g = groups.get((c["make"], c["model"], c["grp"]))
@@ -1833,7 +1883,8 @@ def main():
             c["id"], c["verdict"] or "", c["label"] or "",
             1 if c["stale"] else 0, c["seen_date"],
             round(q25) if q25 else None, round(q75) if q75 else None,
-            list(c["similar"]) if c["similar"][0] else None])
+            list(c["similar"]) if c["similar"][0] else None,
+            round(likely_sale(exp, sales)[0]) if sales and exp else None])
 
     # The "unchecked" cars, best first: what the targeted description fetch
     # (scrape.py --ids-file) should spend its requests on. Reading their ads
@@ -1882,6 +1933,8 @@ def main():
             "declared": sum(1 for c in cars if c["suspect_declared"]),
             "damage_checked": sum(1 for c in cars if c.get("damaged") is not None),
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            # what the likely sale price rests on
+            "sale": {"ratio": round(sales["all"][0], 3), "n": sales["all"][1]} if sales else None,
         },
     }
     # "</" would close the <script> block early and take the rest of the page with

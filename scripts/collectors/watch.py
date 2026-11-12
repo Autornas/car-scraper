@@ -593,7 +593,7 @@ def score_new(site, session, watch, rows, model, compiled, found, blocks, args):
                               mid, lo, row["link"], also, similar, v)
         print(f"  {v.upper():<16} {'★ ' if watched else ''}"
               f"{row['title']} {row['year']} €{row['price_eur']:,} "
-              f"(expected €{mid:,.0f}, low end €{lo:,.0f}; "
+              f"(typical asking €{mid:,.0f}, low end €{lo:,.0f}; "
               + (f"{similar[1]} of {similar[0]} similar cars cheaper, median €{similar[2]:,}"
                  if similar[0] else "no similar cars in the database")
               + f") {row['link']}"

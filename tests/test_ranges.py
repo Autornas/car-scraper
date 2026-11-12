@@ -70,3 +70,36 @@ def test_unknown_mileage_compares_with_every_mileage():
     others = [car(i, 2005, 100_000 * i, 1000) for i in range(1, 6)]
     st.attach_similar([target, *others])
     assert target["similar"][0] == 5
+
+
+# --------------------------------------------------------------------------- #
+# likely sale price, from the cars that left the sites
+# --------------------------------------------------------------------------- #
+def gone(i, mid, price, **kw):
+    return {"id": str(i), "gone": True, "p_mid": mid, "price_eur": price, **kw}
+
+
+def test_sale_ratio_needs_enough_sold_cars():
+    assert st.sale_ratios([gone(i, 1000, 800) for i in range(29)]) == {}
+    table = st.sale_ratios([gone(i, 1000, 800) for i in range(30)])
+    assert table["all"] == (0.8, 30)
+
+
+def test_sale_ratio_skips_flagged_fake_and_unsold_cars():
+    cars = [gone(i, 10_000, 9_000) for i in range(30)]
+    cars += [gone(100, 10_000, 1_000, suspect=True), gone(101, 10_000, 500, price_outlier=True),
+             {"id": "102", "gone": False, "p_mid": 10_000, "price_eur": 100}]
+    assert st.sale_ratios(cars)["all"] == (0.9, 30)
+
+
+def test_sale_price_uses_its_price_band_when_the_band_has_enough():
+    cheap = [gone(i, 1_000, 700) for i in range(40)]          # old cars: 0.7x
+    dear = [gone(100 + i, 20_000, 19_000) for i in range(40)]  # newer: 0.95x
+    table = st.sale_ratios(cheap + dear)
+    assert st.likely_sale(1_500, table) == (pytest.approx(1_050), 40)
+    assert st.likely_sale(30_000, table) == (pytest.approx(28_500), 40)
+    # a band with too few sold cars falls back to all of them
+    sale, n = st.likely_sale(8_000, table)
+    assert n == 80 and sale == pytest.approx(8_000 * table["all"][0])
+    assert st.likely_sale(None, table) == (None, 0)
+    assert st.likely_sale(1_000, {}) == (None, 0)

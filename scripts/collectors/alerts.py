@@ -65,7 +65,7 @@ def deal_message(source, title, year, price, mid, lo, link, also=None, similar=N
     under = round((lo - price) / lo * 100) if lo else 0
     what = "Deal" if verdict == "deal" else "Possible deal"
     text = (f"{what} on {source}: {title} {year or ''} for €{price:,}\n"
-            f"Expected €{mid:,.0f}; {under}% under the low end of its range.\n")
+            f"Typical asking €{mid:,.0f}; {under}% under the low end of its range.\n")
     if similar and similar[0]:
         n, cheaper, median = similar
         text += f"Cheaper than {n - cheaper} of {n} similar cars (their median €{median:,}).\n"

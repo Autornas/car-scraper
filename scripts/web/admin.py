@@ -554,7 +554,7 @@ function renderWatcher(w,running){
   const cls=VERDICT[d.verdict]||"other";
   return `<div class="deal"><span class="t">${d.watch?'<span class="star" title="Fits your watchlist">★</span> ':""}${esc(d.title)} ${d.year??""}</span>
    <span class="p">€${fmt(d.price)}</span><span class="v ${cls}">${esc(d.verdict)}</span>
-   <span class="m">${esc(d.source)} · expected €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
+   <span class="m">${esc(d.source)} · typical asking €${fmt(d.mid)} · ${under!=null?under+"% under the low end":""}${d.km?" · "+fmt(d.km)+" km":""}${
     similarText(d)}${d.flags?" · "+esc(d.flags.split("|").join(", ")):""}${alsoText(d.also)} · ${ago(d.found_at)} ·
     <a href="${esc(d.link)}" target="_blank" rel="noreferrer">open ↗</a></span></div>`;
  }).join(""):`<div class="empty">${only?"No recent deal fits your watchlist yet.":"No new car under its price range yet."}</div>`;
