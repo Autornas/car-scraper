@@ -983,7 +983,7 @@ def verdict_summary(cars):
 HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Autoplius price baselines</title>
+<title>Car deals</title>
 <style>
   :root{color-scheme:light;
     --surface-1:#fcfcfb;--surface-2:#f3f3f1;--surface-3:#e9e9e6;--border:#dcdcd8;
@@ -1085,12 +1085,6 @@ HTML = r"""<!doctype html>
   svg{display:block;width:100%;overflow:visible}
   .scrollpane{flex:1;min-height:0;overflow:auto}
   .muted{color:var(--text-muted);font-size:12px}
-  /* where the price sits in its range: p10-p90 faint, p25-p75 strong, dot = price */
-  .rbar{display:block;margin:4px 0 0 auto;width:120px;height:10px;overflow:visible}
-  .rbar .wide{fill:var(--surface-3)}.rbar .mid{fill:var(--series-1);opacity:.45}
-  .rbar .dot{fill:var(--text-primary);stroke:var(--surface-1);stroke-width:1.5}
-  .rbar .dot.under{fill:var(--good)}.rbar .dot.over{fill:var(--bad)}
-  .s.sale{color:var(--text-secondary);margin-top:2px}
   .count{color:var(--text-muted);font-size:12px}
   .empty{padding:22px;color:var(--text-muted);font-size:14px;text-align:center}
   /* Not wide enough for groups and their cars side by side: stack them, each
@@ -1107,7 +1101,7 @@ HTML = r"""<!doctype html>
   }
 </style></head><body><div class="app">
 <header class="top">
-  <h1>Autoplius price baselines</h1>
+  <h1>Car deals</h1>
   <span class="sub" id="sub"></span>
 </header>
 <div class="tiles" id="tiles"></div>
@@ -1135,52 +1129,51 @@ HTML = r"""<!doctype html>
 
 <section class="panel" id="p-cars" role="tabpanel" aria-labelledby="t-cars">
   <div class="bar">
-    <select id="verdictSel" aria-label="Verdict">
-      <option value="" data-name="Deals, unchecked and other cheap cars">Deals, unchecked and other cheap cars</option>
-      <option value="deal" data-name="Deals">Deals</option>
-      <option value="unchecked" data-name="Unchecked">Unchecked</option>
-      <option value="damaged" data-name="Damaged">Damaged</option>
-      <option value="problem" data-name="Problem">Problem</option>
-      <option value="not a real price" data-name="Not a real price">Not a real price</option>
-      <option value="labelled" data-name="Labelled by you">Labelled by you</option>
-      <option value="all" data-name="Everything under typical asking">Everything under typical asking</option>
+    <label class="muted" for="verdictSel">Show</label>
+    <select id="verdictSel" aria-label="Which cars to show">
+      <option value="" data-name="Deals">Deals</option>
+      <option value="unchecked" data-name="Possible deals, ad not read yet">Possible deals, ad not read yet</option>
+      <option value="cheap" data-name="Every car under its usual price">Every car under its usual price</option>
+      <optgroup label="Cheap for a reason">
+        <option value="damaged" data-name="Damaged">Damaged</option>
+        <option value="problem" data-name="Problem in the ad">Problem in the ad</option>
+        <option value="not a real price" data-name="Not a real price">Not a real price</option>
+      </optgroup>
+      <optgroup label="More">
+        <option value="all" data-name="All cheap cars, problems too">All cheap cars, problems too</option>
+        <option value="market" data-name="Every car, dearer ones too">Every car, dearer ones too</option>
+        <option value="old" data-name="Sold or not seen lately">Sold or not seen lately</option>
+        <option value="labelled" data-name="Labelled by you">Labelled by you</option>
+      </optgroup>
     </select>
-    <label class="toggle" title="Also list the cars priced at or above their typical asking price, to see the whole market for a model"><input type="checkbox" id="showAll">Show dearer cars too</label>
-    <label class="toggle"><input type="checkbox" id="showOld">Include cars not seen
-      recently&nbsp;<span id="oldCount" class="muted"></span></label>
     <span class="spacer"></span>
     <span class="count" id="carsCount"></span>
   </div>
   <details class="help"><summary>How to read this list</summary>
-    <p><strong>Candidates, not deals.</strong> <span id="basisNote"></span></p>
-    <p><strong>vs low end</strong> is how far the price sits under the bottom of that range:
-    positive means cheaper than 9 in 10 comparable cars. Click a row for the seller's
-    description and every detail.</p>
-    <p><strong>Current cars only.</strong> Sold cars (<span class="pill gone">gone</span>) and
-    cars no scrape has seen for over <span id="staleDays"></span> days (they may be sold)
-    are hidden; tick <em>Include cars not seen recently</em> to see them.</p>
-    <p><strong>Verdicts.</strong> <span class="pill good-pill">deal</span> under the low end,
-    ad read, nothing found · <span class="pill">unchecked</span> under the low end, ad not read
-    yet · <span class="pill flag">damaged</span> a defect declared on the site ·
-    <span class="pill flag">problem</span> problem words in the seller's text (not running,
-    no TA, export, parts, lease transfer) · <span class="pill odd">not a real price</span>
-    under 30% of expected or far outside its group: a lease figure, deposit, typo or parts car.
-    Unchecked cars become one of the others once their ad is read: the nightly job reads the
-    best ones, and <em>Update database</em> in the dashboard does it on demand.</p>
+    <p><strong>Usual price</strong> is what sellers typically ask for this exact car: same
+    model, year, mileage, engine, gearbox and body, learned from every listing on both sites.
+    <strong>Sells for ≈</strong> is what cars like it actually go for, judged from the cars
+    that have left the sites <span id="saleNote"></span>.</p>
+    <p><strong>Cheaper</strong> is how far the price is under the usual price. A
+    <span class="pill good-pill">deal</span> is clearly cheaper (cheaper than 9 in 10 such cars),
+    its ad has been read and nothing wrong was found; <span class="pill">unchecked</span> is
+    the same before its ad is read. <span class="pill flag">damaged</span>,
+    <span class="pill flag">problem</span> and <span class="pill odd">not a real price</span>
+    cars are cheap for a reason. The list starts with deals only; pick more under <em>Show</em>.</p>
+    <p>Click a car for the seller's description, similar cars for sale and the price range.
+    Sold cars and cars not seen for over <span id="staleDays"></span> days are hidden
+    (<em>Show → Sold or not seen lately</em>).</p>
     <p id="labelHelp"><strong>Your verdict.</strong> Open a car and mark it <em>real deal</em>,
-    <em>damaged</em> or <em>fake price</em>. Your label overrides the verdict in this list,
-    is kept in the database, and the <em>Verdicts</em> tab shows how often the two agree.
-    Saving labels works when the report is opened from the dashboard.</p>
+    <em>damaged</em> or <em>fake price</em>; it overrides the verdict here. Saving works when
+    the report is opened from the dashboard.</p>
   </details>
   <div class="tablebox"><table id="cars"><thead><tr>
     <th data-k="car">Car</th>
     <th class="num" data-k="year">Year</th>
-    <th class="num" data-k="price">Price</th>
-    <th class="num" data-k="base">Typical asking <span class="muted">/ range · likely sale</span></th>
-    <th class="num" data-k="simrank">Similar cars</th>
-    <th class="num" data-k="vslo">vs low end</th>
-    <th class="num" data-k="vs">vs asking</th>
     <th class="num" data-k="km">km</th>
+    <th class="num" data-k="price">Price</th>
+    <th class="num" data-k="base" title="what sellers usually ask for this exact car">Usual price</th>
+    <th class="num" data-k="vs" title="how far the price is under the usual price">Cheaper</th>
     <th></th>
   </tr></thead><tbody></tbody></table></div>
 </section>
@@ -1250,9 +1243,10 @@ const detailRow = (c, cols) => {
     ["First price", c[C.first] && c[C.first]!==c[C.price] ? eur(c[C.first]) : ""],
     ["Days listed", c[C.days]], ["Flags", (c[C.flags]||"").split("|").join(", ")],
     ["Also listed", alsoList(c).map(o => `${o.src} ${o.price ? eur(o.price) : ""}`).join(", ")],
-    ["Likely sale price", c[C.sale] ? `≈ ${eur(c[C.sale])} (from ${DATA.meta.sale.n} cars that left the sites)` : ""],
-    ["Typical range", c[C.q25] ? `${eur(c[C.q25])}–${eur(c[C.q75])} (low end ${eur(c[C.lo])}, high ${eur(c[C.hi])})` : ""],
-    ["Similar cars", c[C.sim] ? `${c[C.sim][0]} · median ${eur(c[C.sim][2])} · middle half ${eur(c[C.sim][3])}–${eur(c[C.sim][4])}` : ""],
+    ["Usual price range", c[C.q25] ? `${eur(c[C.q25])}–${eur(c[C.q75])} (half of such cars ask this)` : ""],
+    ["Similar cars for sale", c[C.sim] ? `${c[C.sim][0]}, typically ${eur(c[C.sim][2])}; this one is cheaper than ${
+      c[C.sim][0]-c[C.sim][1]} of them` : ""],
+    ["Site", SITES.length > 1 ? c[C.src] : ""],
   ].filter(([,v]) => v!=null && v!=="").map(([k,v]) => `<span>${k}: <b>${esc(v)}</b></span>`).join("");
   return `<tr class="detail" hidden><td colspan="${cols}"><div class="facts">${facts}</div>${
     d ? `<div class="desc">${esc(d)}</div>`
@@ -1346,55 +1340,29 @@ const basisTitle = g => g.fit
     + `too few cars with mileage, or the model lost to the median in cross-validation.`;
 
 document.getElementById("sub").textContent =
-  `${DATA.meta.cars.toLocaleString()} priced cars`
-  + (DATA.meta.duplicates ? ` (${DATA.meta.duplicates.toLocaleString()} listed on two sites, counted once)` : "")
-  + ` · ${DATA.meta.groups} groups of `
-  + `${DATA.meta.min_n}+ cars · ${DATA.meta.gen_groups} grouped by generation · `
-  + `${DATA.meta.skipped_total} listings skipped · generated ${DATA.meta.generated}`;
+  `${DATA.meta.cars.toLocaleString()} cars for sale on `
+  + [...new Set(DATA.cars.map(c => c[C.src]).filter(Boolean))].sort().map(x => x + ".lt").join(" and ")
+  + ` · updated ${DATA.meta.generated}`;
 const VS = Object.fromEntries(DATA.meta.verdicts.map(r => [r.verdict, r]));
 const LABELLED = DATA.meta.verdicts.reduce((a, r) => a + r.labelled, 0);
 const AGREED = DATA.meta.verdicts.reduce((a, r) => a + r.agreed, 0);
+/* Three numbers a buyer cares about; the model's accuracy and the rest live
+   in the Verdicts tab and the "How to read" notes. */
 document.getElementById("tiles").innerHTML=[
-  ["Listings",DATA.meta.cars.toLocaleString(),`${DATA.meta.models} models · ${DATA.meta.groups} groups`],
-  ["Median price",eur(DATA.meta.median),"across every priced listing"],
-  ["Baseline error","±"+DATA.meta.baseline_err+"%",
-   `How far the baseline typically misses one car. Group medians alone would be ±${DATA.meta.median_err}%.`],
-  DATA.meta.pooled
-  ? ["Pooled model","±"+DATA.meta.pooled.err+"%",
-     `One LightGBM model over all ${DATA.meta.pooled.n.toLocaleString()} cars, priced out of fold. `
-     + `Typical miss on a clean car ±${DATA.meta.pooled.err}%; p10-p90 ranges calibrated to hold 80% of cars.`]
-  : ["Modelled cars",DATA.meta.priced.toLocaleString(),
-     `${DATA.meta.fitted} of ${DATA.meta.groups} groups earned a km+year price model; the rest use their median.`],
+  ["Cars for sale", DATA.meta.cars.toLocaleString(), "every priced listing, both sites, each car counted once"],
   ["Deals", (VS.deal ? VS.deal.n : 0).toLocaleString(),
-   `Under the low end of their range, ad read, nothing found. `
-   + `${(VS.unchecked ? VS.unchecked.n : 0).toLocaleString()} more are unchecked; `
-   + `${["damaged","problem","not a real price"].map(v => `${VS[v] ? VS[v].n : 0} ${v}`).join(", ")}.`],
-  ...(DATA.meta.viewer ? [] : [["Your checks",
-   LABELLED ? `${Math.round(AGREED / LABELLED * 100)}% agree` : "none yet",
-   LABELLED ? `${LABELLED} cars labelled by you; the verdict agreed on ${AGREED}.`
-            : "Open a car and mark it real deal, damaged or fake price."]]),
-  ["Price cuts seen",DATA.meta.drops,"listings whose asking price fell since first seen"],
-  ["Disappeared",DATA.meta.sold.gone,"listings that stopped appearing while their model was still scraped"],
+   "clearly under the usual price, ad read, nothing wrong found"],
+  ["Sold", DATA.meta.sold.gone.toLocaleString(),
+   "listings that disappeared from the sites: most likely sold"],
 ].map(([l,v,t])=>`<div class="tile" title="${esc(t)}"><div class="v">${v}</div>
   <div class="l">${l}</div></div>`).join("");
 
 /* ---------- sorting ---------- */
-document.getElementById("basisNote").textContent = DATA.meta.pooled
-  ? "Each car is compared with a pooled price model trained on every listing (make, model, "
-    + "generation, year, mileage, fuel, engine, kW, gearbox, body, seller type, declared damage), "
-    + "using a model that never saw that car. Typical asking is the median ASKING price for "
-    + "that car — what sellers list it for, not what it sells for. Likely sale is that price "
-    + "times what the cars that left the sites (most likely sold) last asked compared with "
-    + "their typical asking, per price band once a band has 30 of them" + (DATA.meta.sale
-    ? ` (${DATA.meta.sale.ratio.toFixed(2)}× overall so far, from ${DATA.meta.sale.n} cars; it `
-    + "updates itself as more cars sell)" : " (not enough sold cars yet)") + ". The typical range is "
-    + "where half of identical cars sit (25th-75th percentile); the bar under it also shows the "
-    + "10th-90th, and the dot is this car's price. The low end used for deals is the 10th "
-    + "percentile. Similar cars are real listings: same model, year ±1, mileage ±30%, no "
-    + "declared defect; the column says how many cost more than this one, and their median."
-  : "Each car is compared with its group's km+year model, or the group median "
-    + "(med) where no model earned its place. Install lightgbm for per-car price ranges.";
-const SORT={groups:{k:"n",d:-1},cars:{k:"vslo",d:-1},drops:{k:"drop",d:-1},drilltbl:{k:"price",d:1}};
+document.getElementById("saleNote").textContent = DATA.meta.sale
+  ? `(${DATA.meta.sale.n} so far, at about ${Math.round((1 - DATA.meta.sale.ratio) * 100)}% under the `
+    + "usual price; it updates itself as more cars sell)"
+  : "(not shown until 30 cars have sold)";
+const SORT={groups:{k:"n",d:-1},cars:{k:"vs",d:-1},drops:{k:"drop",d:-1},drilltbl:{k:"price",d:1}};
 function sortRows(rows,s){
   return rows.sort((a,b)=>{
     const x=a[s.k],y=b[s.k];
@@ -1473,11 +1441,11 @@ document.getElementById("fuel").onchange=readFilters;
 document.getElementById("gearSel").onchange=readFilters;
 document.getElementById("siteSel").onchange=readFilters;
 document.getElementById("verdictSel").onchange=()=>drawCars();
-document.getElementById("showOld").onchange=()=>drawCars();
-document.getElementById("showAll").onchange=()=>drawCars();
 if (DATA.meta.viewer) {
   document.querySelector('#verdictSel option[value="labelled"]').remove();
   document.getElementById("labelHelp").remove();
+  /* model groups and verdict statistics are for checking the scraper, not buying */
+  ["t-groups", "t-sold"].forEach(id => document.getElementById(id).remove());
 }
 document.getElementById("reset").onclick=()=>{
   clearTimeout(debounceT);
@@ -1527,33 +1495,12 @@ function carRow(c,g){
     year:c[C.year], price:c[C.price],
     base, modelled:c[C.exp]!=null,
     vs: base ? (base-c[C.price])/base*100 : null,
-    lo:c[C.lo], hi:c[C.hi], q25:c[C.q25], q75:c[C.q75], sim:c[C.sim],
-    /* sorts best first: the share of similar cars that cost more */
-    simrank: c[C.sim] ? (c[C.sim][0]-c[C.sim][1])/c[C.sim][0] : null,
+    lo:c[C.lo], hi:c[C.hi],
     vslo: c[C.lo] ? (c[C.lo]-c[C.price])/c[C.lo]*100 : null,
     kw:c[C.kw], gear:c[C.gear]||null,
     km:c[C.km], kmr:c[C.kmr], fuel:c[C.fuel]||null, engine:c[C.engine]||null,
     drop:c[C.drop]||null, first:c[C.first], days:c[C.days],
     median:g?g.median:null};
-}
-/* p10-p90 faint, p25-p75 strong, the car's price as a dot */
-function rangeBar(r){
-  if(!r.lo||!r.hi||!r.q25)return "";
-  const a=Math.min(r.lo,r.price), b=Math.max(r.hi,r.price), W=120, x=v=>(v-a)/((b-a)||1)*W;
-  const cls=r.price<r.q25?"under":r.price>r.q75?"over":"";
-  return `<svg class="rbar" viewBox="0 0 ${W} 10" aria-hidden="true">
-    <rect class="wide" x="${x(r.lo)}" y="3" width="${x(r.hi)-x(r.lo)}" height="4" rx="2"/>
-    <rect class="mid" x="${x(r.q25)}" y="2" width="${x(r.q75)-x(r.q25)}" height="6" rx="2"/>
-    <circle class="dot ${cls}" cx="${x(r.price)}" cy="5" r="3.5"/></svg>`;
-}
-/* "cheaper than 20 of 26 / median €1,475" */
-function simCell(sim){
-  if(!sim)return `<td class="num"><span class="s">no similar cars</span></td>`;
-  const [n,cheaper,median]=sim, more=n-cheaper;
-  const few=n<5;
-  return `<td class="num" title="real listings: same model, year ±1, mileage ±30%, no declared defect${
-    few?" — too few to be sure":""}"><span${few?' class="s"':""}>cheaper than ${more} of ${n}</span>
-    <span class="s">median ${eur(median)}</span></td>`;
 }
 const baseCell = r => `<td class="num" title="${!r.modelled
     ? "group median — this group has no price model"
@@ -1644,46 +1591,51 @@ function groupStats(g){
 const BAD = new Set(["damaged", "problem", "not a real price"]);
 function drawCars(){
   const sel = document.getElementById("verdictSel"), want = sel.value;
-  const rows = [], counts = {all: 0, labelled: 0}; let shownByDefault = 0;
-  const showOld = document.getElementById("showOld").checked; let old = 0;
-  const showAll = document.getElementById("showAll").checked;
+  const rows = [], counts = {all: 0, labelled: 0, market: 0, old: 0}; let shownByDefault = 0;
   for(const c of DATA.cars){
     if(!match(c))continue;
     const g=GMAP[gkey(c)];
     if(!g && c[C.exp]==null)continue;
     const r=carRow(c,g);
-    if(!(r.vs>0) && !showAll)continue;
-    /* sold (gone) or not seen for a while (stale): hidden unless asked for */
-    if ((c[C.gone] || c[C.stale]) && !showOld) { old++; continue; }
+    const cheap = r.vs>0, old = !!(c[C.gone] || c[C.stale]);
+    /* sold (gone) or not seen for a while (stale): only under "Sold or not seen lately" */
+    if (old) { if (cheap) { counts.old++; if (want === "old") rows.push(r); } continue; }
+    counts.market++;
+    if (want === "market") rows.push(r);
+    if (!cheap) continue;
     const v = effVerdict(c);
     counts.all++; counts[v] = (counts[v] || 0) + 1;
     if (!BAD.has(v)) shownByDefault++;
     if (c[C.label]) counts.labelled++;
-    const keep = want === "" ? !BAD.has(v) : want === "all" ? true
+    if (want === "market" || want === "old") continue;
+    const keep = want === "" ? v === "deal" : want === "cheap" ? !BAD.has(v) : want === "all" ? true
       : want === "labelled" ? !!c[C.label] : v === want;
     if (keep) rows.push(r);
   }
   /* counts on the dropdown itself, for the current filters */
-  document.getElementById("oldCount").textContent = showOld ? "" : `(${old.toLocaleString()} hidden)`;
   [...sel.options].forEach(o => o.textContent =
-    `${o.dataset.name} (${(o.value === "" ? shownByDefault : counts[o.value] || 0).toLocaleString()})`);
+    `${o.dataset.name} (${(o.value === "" ? counts.deal || 0 : o.value === "cheap" ? shownByDefault
+      : counts[o.value] || 0).toLocaleString()})`);
   paint("cars",rows,r=>`<tr class="click">
       <td class="main"><strong>${esc(cap(r.c[C.make]))} ${esc(mname(r.c[C.model]))}</strong>${
-        r.g&&r.g.is_gen?`<span class="pill gen">${esc(r.g.gen)}</span>`:""}${
-        verdictPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${sitePill(r.c)}${alsoPill(r.c)}${r.drop?`<span class="pill">cut ${r.drop}%</span>`:""}
-        <span class="s">${spec(r.c)||"&nbsp;"}</span></td>
+        verdictPill(r.c)}${gonePill(r.c)}${flagPill(r.c)}${alsoPill(r.c)}${
+        r.drop?`<span class="pill" title="the seller lowered the price">cut ${r.drop}%</span>`:""}
+        <span class="s">${[spec(r.c), SITES.length > 1 ? esc(r.c[C.src]) : ""].filter(Boolean).join(" · ")||"&nbsp;"}</span></td>
       <td class="num">${r.year}</td>
+      <td class="num">${num(r.km)}</td>
       <td class="num"><strong>${eur(r.price)}</strong></td>
-      <td class="num" title="${r.modelled?"what the model expects for this exact car; half of identical cars sit in the typical range":"group median"}">${
-        eur(r.base)}${r.modelled?"":'<span class="pill">med</span>'}<span class="s">${
-        r.q25?eur(r.q25)+"–"+eur(r.q75):"&nbsp;"}</span>${rangeBar(r)}${r.c[C.sale]
-        ?`<span class="s sale" title="what cars like this most likely sell for: typical asking scaled by what ${
-          DATA.meta.sale.n} cars that left the sites (most likely sold) last asked">likely sale ≈ ${eur(r.c[C.sale])}</span>`:""}</td>
-      ${simCell(r.sim)}
-      ${vsCell(r.vslo)}${vsCell(r.vs)}
-      <td class="num">${num(r.km)}${r.kmr?`<span class="s"${r.kmr>1.3?' style="color:var(--warn)"':""}>${r.kmr}× group</span>`:""}</td>
-      <td>${alink(r.c[C.link])}</td></tr>${detailRow(r.c,9)}`,
-    9,"no candidates match the filters");
+      <td class="num">${eur(r.base)}${r.c[C.sale]
+        ?`<span class="s" title="what cars like this actually sell for">sells for ≈ ${eur(r.c[C.sale])}</span>`:""}</td>
+      ${cheaperCell(r)}
+      <td>${alink(r.c[C.link])}</td></tr>${detailRow(r.c,7)}`,
+    7, want === "old" ? "no sold or old cars match the filters" : "no cars match the filters");
+}
+/* "−69% / €2,238 less", or "+12% / €400 more" for a dearer car */
+function cheaperCell(r){
+  if(r.vs==null||!r.base)return '<td class="num neutral">—</td>';
+  const diff=Math.round(r.base-r.price);
+  return `<td class="num ${r.vs>0?"good":"neutral"}"><strong>${vsText(r.vs)}</strong><span class="s">${
+    diff>=0?eur(diff)+" less":eur(-diff)+" more"}</span></td>`;
 }
 wireExpand("cars");
 
